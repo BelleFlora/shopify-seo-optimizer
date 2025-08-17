@@ -59,6 +59,45 @@ def paged_shopify_get(path, token, limit=250, params=None):
         if len(items) < params['limit']: break
     return out
 
+def shopify_graphql_update_product(store_domain, access_token, product_id_int,
+                                   new_title, new_desc_html, seo_title, seo_desc):
+    """
+    Updatet producttitel, beschrijving (HTML) en SEO (title/description) via GraphQL productUpdate.
+    Vereist Admin API scope: write_products (en read_products als je eerst leest).
+    """
+    gid = f"gid://shopify/Product/{int(product_id_int)}"
+    url = f"https://{store_domain}/admin/api/2025-01/graphql.json"  # 2024-07 of nieuwer is ook oké
+    mutation = """
+    mutation productSeoAndDesc($input: ProductInput!) {
+      productUpdate(input: $input) {
+        product { id title seo { title description } }
+        userErrors { field message }
+      }
+    }"""
+    variables = {
+        "input": {
+            "id": gid,
+            "title": new_title,                   # laat weg als je titel niet wilt overschrijven
+            "descriptionHtml": new_desc_html,     # HTML toegestaan
+            "seo": {"title": seo_title, "description": seo_desc}  # beide tegelijk meesturen!
+        }
+    }
+    r = requests.post(
+        url,
+        headers={
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json={"query": mutation, "variables": variables},
+        timeout=60,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("errors") or (data.get("data", {}).get("productUpdate", {}).get("userErrors")):
+        raise RuntimeError(f"Shopify GraphQL error: {data}")
+    return data["data"]["productUpdate"]["product"]
+                                       
 def split_ai_output(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     blob = '\n'.join(lines)
