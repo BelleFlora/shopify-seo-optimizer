@@ -10,6 +10,7 @@ import time
 import random
 import textwrap
 import urllib.request
+import urllib.error
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -28,7 +29,7 @@ SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "your-store.myshop
 
 HTTP_TIMEOUT = 60
 OPENAI_TIMEOUT = 120
-BATCH_SIZE = 20
+BATCH_SIZE = 8             # verlaagd tempo om 429's te vermijden
 SHOPIFY_API_VER = "2025-07"  # recente Admin API
 
 # ------------------------------------------------------------------------------
@@ -46,7 +47,10 @@ def require_login(fn):
 
 def openai_chat(api_key: str, system_prompt: str, user_prompt: str,
                 model: str = "gpt-4o-mini", temperature: float = 0.7) -> str:
-    """Kleine wrapper rond OpenAI Chat Completions API."""
+    """
+    OpenAI Chat Completions met retries op 429/5xx en respect voor Retry-After.
+    Verlaagt tempo automatisch en geeft duidelijke foutbron.
+    """
     url = "https://api.openai.com/v1/chat/completions"
     body = {
         "model": model,
@@ -57,14 +61,63 @@ def openai_chat(api_key: str, system_prompt: str, user_prompt: str,
         ],
     }
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-        return payload["choices"][0]["message"]["content"]
+
+    max_retries = 8
+    backoff = 1.0
+
+    for attempt in range(1, max_retries + 1):
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+                # kleine pauze na succesvolle call om RPM te spreiden
+                time.sleep(1.0)
+                return payload["choices"][0]["message"]["content"]
+
+        except urllib.error.HTTPError as e:
+            # 429 → Too Many Requests (OpenAI) of 5xx → backoff & retry
+            if e.code == 429 or 500 <= e.code < 600:
+                retry_after = e.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait = max(0.0, float(retry_after))
+                        time.sleep(wait)
+                    except Exception:
+                        time.sleep(backoff)
+                else:
+                    time.sleep(backoff)
+
+                backoff = min(backoff * 1.7, 20.0)
+                if attempt == max_retries:
+                    details = ""
+                    try:
+                        details = e.read().decode("utf-8", "ignore")
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"OpenAI 429/5xx na retries (attempt {attempt}): {details}")
+                continue
+
+            # Andere HTTP fout
+            details = ""
+            try:
+                details = e.read().decode("utf-8", "ignore")
+            except Exception:
+                pass
+            raise RuntimeError(f"OpenAI HTTP error {e.code}: {details}")
+
+        except Exception as ex:
+            # Netwerk/timeout → retry met backoff
+            time.sleep(backoff)
+            backoff = min(backoff * 1.7, 20.0)
+            if attempt == max_retries:
+                raise RuntimeError(f"OpenAI request mislukt na retries: {ex}")
+
+    # zou niet bereikt moeten worden
+    raise RuntimeError("OpenAI onverklaarbare fout")
 
 
 def shopify_headers(token: str) -> Dict[str, str]:
@@ -421,7 +474,8 @@ def api_optimize():
                     final_prompt = (user_prompt + "\n\n" + base_prompt).strip() if user_prompt else base_prompt
 
                     try:
-                        # 2a) AI-tekst genereren
+                        # 2a) AI-tekst genereren (extra rust vóór de call om bursts te vermijden)
+                        time.sleep(0.8)
                         out = openai_chat(api_key, sys, final_prompt, model=model)
                         pieces = split_ai_output(out)
 
@@ -447,7 +501,13 @@ def api_optimize():
                         time.sleep(1.2)
 
                     except Exception as e:
-                        yield f"❌ Fout bij product #{p.get('id')}: {e}\n"
+                        msg = str(e)
+                        if "OpenAI" in msg:
+                            yield f"❌ OpenAI-fout bij product #{p.get('id')}: {msg}\n"
+                        elif "Shopify" in msg:
+                            yield f"❌ Shopify-fout bij product #{p.get('id')}: {msg}\n"
+                        else:
+                            yield f"❌ Onbekende fout bij product #{p.get('id')}: {msg}\n"
 
                 # Batch rust
                 yield f"-- Batch klaar ({len(prods)} producten) --\n"
