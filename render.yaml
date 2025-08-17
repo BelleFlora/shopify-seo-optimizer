@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: shopify-seo-optimizer
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    envVars:
+      - key: ADMIN_USERNAME
+        value: michiel
+      - key: ADMIN_PASSWORD
+        sync: false   # zet dit handmatig in Render dashboard
+      - key: SHOPIFY_STORE_DOMAIN
+        value: your-store.myshopify.com
+      - key: FLASK_SECRET
+        generateValue: true
