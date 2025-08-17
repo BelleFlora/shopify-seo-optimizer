@@ -50,13 +50,18 @@ def paged_shopify_get(path, token, limit=250, params=None):
         data = r.json()
         key = None
         for k in ('custom_collections','smart_collections','products','collects'):
-            if k in data: key = k; break
-        if not key: break
+            if k in data:
+                key = k
+                break
+        if not key:
+            break
         items = data.get(key, [])
-        if not items: break
+        if not items:
+            break
         out.extend(items)
         since_id = items[-1]['id']
-        if len(items) < params['limit']: break
+        if len(items) < params['limit']:
+            break
     return out
 
 def shopify_graphql_update_product(store_domain, access_token, product_id_int,
@@ -66,7 +71,8 @@ def shopify_graphql_update_product(store_domain, access_token, product_id_int,
     Vereist Admin API scope: write_products (en read_products als je eerst leest).
     """
     gid = f"gid://shopify/Product/{int(product_id_int)}"
-    url = f"https://{store_domain}/admin/api/2025-01/graphql.json"  # 2024-07 of nieuwer is ook oké
+    # Gebruik een recente Admin API versie; 2025-07 is prima, 2025-01 ook
+    url = f"https://{store_domain}/admin/api/2025-07/graphql.json"
     mutation = """
     mutation productSeoAndDesc($input: ProductInput!) {
       productUpdate(input: $input) {
@@ -97,13 +103,14 @@ def shopify_graphql_update_product(store_domain, access_token, product_id_int,
     if data.get("errors") or (data.get("data", {}).get("productUpdate", {}).get("userErrors")):
         raise RuntimeError(f"Shopify GraphQL error: {data}")
     return data["data"]["productUpdate"]["product"]
-                                       
+
 def split_ai_output(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     blob = '\n'.join(lines)
     def take(after):
         for a in after:
-            if a.lower() in blob.lower(): return a
+            if a.lower() in blob.lower():
+                return a
         return None
     markers = {
         'title': take(['Nieuwe titel:','Titel:','SEO titel:','Nieuwe SEO-titel:']),
@@ -136,8 +143,8 @@ def split_ai_output(text):
     return {
         'title': title.strip(),
         'body_html': body.strip(),
-        'meta_title': meta_title.strip()[:60],
-        'meta_description': meta_desc.strip()[:155],
+        'meta_title': (meta_title.strip()[:60]) if meta_title else '',
+        'meta_description': (meta_desc.strip()[:155]) if meta_desc else '',
     }
 
 INDEX_HTML = '''<!doctype html><html lang="nl"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Shopify SEO Optimizer</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:24px;background:#0b1020;color:#eef}.card{max-width:880px;margin:0 auto;background:#121735;padding:20px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}h1{margin-top:0}label{display:block;margin:12px 0 8px}input,textarea,select{width:100%;padding:12px;border-radius:10px;border:1px solid #2a335a;background:#0f1430;color:#eef}button{padding:12px 16px;border:0;border-radius:12px;background:#4f7dff;color:white;font-weight:600;cursor:pointer}.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}.muted{opacity:.85}.status{margin-top:14px;white-space:pre-wrap}</style></head><body><div class="card"><h1>Shopify SEO Optimizer</h1><p class="muted">Log in om door te gaan.</p><form method="post" action="/login"><label>Gebruikersnaam</label><input name="username" placeholder="michiel" required /><label>Wachtwoord</label><input name="password" type="password" required /><div style="margin-top:12px"><button type="submit">Inloggen</button></div></form></div></body></html>'''
@@ -149,147 +156,4 @@ function add(t){qs('#status').textContent+='\\n'+t}
 async function loadCollections(){
   set('Collecties laden...');
   const res = await fetch('/api/collections',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({store:qs('#store').value.trim(),token:qs('#token').value.trim()})});
-  const data = await res.json(); const sel = qs('#collections'); sel.innerHTML='';
-  (data.collections||[]).forEach(c=>{const opt=document.createElement('option'); opt.value=c.id; opt.textContent=`${c.title} (#${c.id})`; sel.appendChild(opt);});
-  qs('#cstatus').textContent=`${(data.collections||[]).length} collecties geladen`; add('Collecties geladen.');
-}
-async function optimize(){
-  const ids = Array.from(qs('#collections').selectedOptions).map(o=>o.value);
-  set('Start optimalisatie...');
-  const res = await fetch('/api/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({store:qs('#store').value.trim(),token:qs('#token').value.trim(),openai:qs('#openai').value.trim(),model:qs('#model').value.trim()||'gpt-4o-mini',prompt:qs('#prompt').value,collection_ids:ids})});
-  const rd = await res.body.getReader(); let dec = new TextDecoder();
-  while(true){ const {value,done} = await rd.read(); if(done) break; add(dec.decode(value)); }
-}
-</script></body></html>'''
-
-@app.route('/login', methods=['GET','POST'])
-def login():
-    if request.method == 'GET':
-        return Response(INDEX_HTML, mimetype='text/html')
-    if request.form.get('username') == ADMIN_USERNAME and request.form.get('password') == ADMIN_PASSWORD:
-        session['logged_in'] = True
-        return redirect('/dashboard')
-    return Response(INDEX_HTML, mimetype='text/html', status=401)
-
-@app.route('/')
-def root():
-    if not session.get('logged_in'):
-        return redirect('/login')
-    return redirect('/dashboard')
-
-@app.route('/dashboard')
-@require_login
-def dashboard():
-    html = DASHBOARD_HTML.replace('{store}', SHOPIFY_STORE_DOMAIN)
-    return Response(html, mimetype='text/html')
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect('/login')
-
-@app.route('/api/collections', methods=['POST'])
-@require_login
-def api_collections():
-    payload = request.get_json(force=True)
-    store = payload.get('store') or SHOPIFY_STORE_DOMAIN
-    token = payload.get('token')
-    global SHOPIFY_STORE_DOMAIN
-    SHOPIFY_STORE_DOMAIN = store
-    if not token:
-        return jsonify({'error':'Geen Shopify token meegegeven.'}), 400
-    customs = paged_shopify_get('/admin/api/2024-07/custom_collections.json', token)
-    smarts  = paged_shopify_get('/admin/api/2024-07/smart_collections.json',  token)
-    cols = [{'id': c['id'], 'title': c.get('title','(zonder titel)')} for c in (customs+smarts)]
-    return jsonify({'collections': cols})
-
-@app.route('/api/optimize', methods=['POST'])
-@require_login
-def api_optimize():
-    payload = request.get_json(force=True)
-    store = payload.get('store') or SHOPIFY_STORE_DOMAIN
-    token = payload.get('token')
-    api_key = payload.get('openai')
-    model = payload.get('model') or 'gpt-4o-mini'
-    user_prompt = (payload.get('prompt') or '').strip()
-    collection_ids = payload.get('collection_ids') or []
-    if not token or not api_key:
-        return jsonify({'error':'OpenAI key en Shopify token zijn verplicht.'}), 400
-
-    def generate():
-        try:
-            all_product_ids = []
-            for cid in collection_ids:
-                collects = paged_shopify_get('/admin/api/2024-07/collects.json', token, params={'collection_id': cid})
-                pids = [c['product_id'] for c in collects]
-                all_product_ids.extend(pids)
-                yield f'Collectie {cid}: {len(pids)} producten gevonden\n'
-            if not collection_ids:
-                yield 'Geen collectie gekozen – hele shop optimaliseren.\n'
-                products = paged_shopify_get('/admin/api/2024-07/products.json', token)
-                all_product_ids = [p['id'] for p in products]
-
-            BATCH = 20
-            processed = 0
-            for i in range(0, len(all_product_ids), BATCH):
-                batch_ids = all_product_ids[i:i+BATCH]
-                ids_param = ','.join(map(str, batch_ids))
-                url = f'https://{store}/admin/api/2024-07/products.json'
-                r = requests.get(url, headers=shopify_headers(token), params={'ids': ids_param, 'limit': 250}, timeout=60)
-                r.raise_for_status()
-                prods = r.json().get('products', [])
-                for p in prods:
-                    title = p.get('title','')
-                    body  = p.get('body_html','')
-                    tags  = p.get('tags','')
-                    sys = 'Je bent een Nederlandstalige e-commerce SEO-copywriter. Schrijf natuurlijk en klantgericht. Houd formatting eenvoudig (paragrafen, lijstjes).'
-                    base_prompt = textwrap.dedent(f'''
-                        Originele titel: {title}
-                        Originele beschrijving (HTML toegestaan): {body}
-                        Tags: {tags}
-
-                        Taken:
-                        1) Nieuwe SEO-geoptimaliseerde titel
-                        2) Gestandaardiseerde productbeschrijving (200–250 woorden)
-                        3) Meta title (max 60 tekens)
-                        4) Meta description (max 155 tekens)
-
-                        Retourneer in dit formaat:
-                        Nieuwe titel: …
-
-                        Beschrijving: …
-
-                        Meta title: …
-
-                        Meta description: …
-                    ''')
-                    final_prompt = (user_prompt + '\n\n' + base_prompt).strip() if user_prompt else base_prompt
-                    try:
-                        out = openai_chat(api_key, sys, final_prompt, model=model)
-                        pieces = split_ai_output(out)
-                        update_payload = {
-                            'product': {
-                                'id': p['id'],
-                                'title': pieces['title'] or title,
-                                'body_html': pieces['body_html'] or body,
-                                'metafields': [
-                                    {'namespace':'global','key':'title_tag','type':'single_line_text_field','value':pieces['meta_title']},
-                                    {'namespace':'global','key':'description_tag','type':'single_line_text_field','value':pieces['meta_description']},
-                                ]
-                            }
-                        }
-                        up = requests.put(f'https://{store}/admin/api/2024-07/products/{p["id"]}.json',
-                                          headers=shopify_headers(token), json=update_payload, timeout=60)
-                        up.raise_for_status()
-                        processed += 1
-                        yield f'✅ #{p["id"]} bijgewerkt: {pieces["title"][:70]}\n'
-                    except Exception as e:
-                        yield f'❌ Fout bij product #{p.get("id")}: {e}\n'
-            yield f'\nKlaar. Totaal bijgewerkt: {processed}.\n'
-        except Exception as e:
-            yield f'⚠️ Beëindigd met fout: {e}\n'
-    return Response(generate(), mimetype='text/plain')
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+  const data = await res.json(); const sel =
