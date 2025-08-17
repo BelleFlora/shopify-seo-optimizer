@@ -29,7 +29,7 @@ SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "your-store.myshop
 HTTP_TIMEOUT = 60
 OPENAI_TIMEOUT = 120
 BATCH_SIZE = 20
-SHOPIFY_API_VER = "2025-07"  # mag recenter
+SHOPIFY_API_VER = "2025-07"  # recente Admin API
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -46,6 +46,7 @@ def require_login(fn):
 
 def openai_chat(api_key: str, system_prompt: str, user_prompt: str,
                 model: str = "gpt-4o-mini", temperature: float = 0.7) -> str:
+    """Kleine wrapper rond OpenAI Chat Completions API."""
     url = "https://api.openai.com/v1/chat/completions"
     body = {
         "model": model,
@@ -75,7 +76,7 @@ def shopify_headers(token: str) -> Dict[str, str]:
 
 
 def _respect_shopify_limit(resp: Optional[requests.Response]) -> None:
-    """Respecteer Retry-After header; anders korte sleep om onder 2 rps te blijven."""
+    """Respecteer Retry-After header; anders korte sleep om onder ~2 rps te blijven."""
     if resp is not None:
         ra = resp.headers.get("Retry-After")
         if ra:
@@ -325,7 +326,7 @@ def logout():
 @app.route("/api/collections", methods=["POST"])
 @require_login
 def api_collections():
-    global SHOPIFY_STORE_DOMAIN
+    global SHOPIFY_STORE_DOMAIN  # vóór gebruik declareren
     payload = request.get_json(force=True)
     store = payload.get("store") or SHOPIFY_STORE_DOMAIN
     token = payload.get("token")
@@ -420,8 +421,50 @@ def api_optimize():
                     final_prompt = (user_prompt + "\n\n" + base_prompt).strip() if user_prompt else base_prompt
 
                     try:
+                        # 2a) AI-tekst genereren
                         out = openai_chat(api_key, sys, final_prompt, model=model)
                         pieces = split_ai_output(out)
 
+                        # 2b) Fallbacks voor SEO
                         seo_title = pieces.get("meta_title") or (pieces.get("title") or title)[:60]
-                        seo_desc = pieces.get("meta
+                        seo_desc = pieces.get("meta_description") or (pieces.get("body_html") or body)[:155]
+
+                        # 2c) Shopify GraphQL update
+                        _ = shopify_graphql_update_product(
+                            store_domain=store,
+                            access_token=token,
+                            product_id_int=p["id"],
+                            new_title=(pieces.get("title") or title),
+                            new_desc_html=(pieces.get("body_html") or body),
+                            seo_title=seo_title,
+                            seo_desc=seo_desc,
+                        )
+
+                        processed += 1
+                        yield f"✅ #{p['id']} bijgewerkt: {(pieces.get('title') or title)[:70]}\n"
+
+                        # 2d) extra ademruimte per product
+                        time.sleep(1.2)
+
+                    except Exception as e:
+                        yield f"❌ Fout bij product #{p.get('id')}: {e}\n"
+
+                # Batch rust
+                yield f"-- Batch klaar ({len(prods)} producten) --\n"
+                time.sleep(3.0)
+
+            yield f"\nKlaar. Totaal bijgewerkt: {processed}.\n"
+
+        except Exception as e:
+            yield f"⚠️ Beëindigd met fout: {e}\n"
+
+    return Response(generate(), mimetype="text/plain")
+
+
+# ------------------------------------------------------------------------------
+# Local run (Render gebruikt gunicorn)
+# ------------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
