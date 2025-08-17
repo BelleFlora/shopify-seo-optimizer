@@ -1,39 +1,42 @@
 # Shopify SEO Optimizer – Flask app (Render/Railway ready)
-# NL UI • Login via env vars • Tokens via UI • Collectie-selectie • Batching • GraphQL productUpdate voor SEO
+# NL UI • Login via env vars • Tokens via UI • Collectie-selectie • Batching
+# GraphQL productUpdate (titel + descriptionHtml + SEO) • Rate limiting + retries
 
 from __future__ import annotations
 
 import os
 import json
+import time
+import random
 import textwrap
 import urllib.request
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 from flask import Flask, Response, jsonify, redirect, request, session
 
 # ------------------------------------------------------------------------------
-# Configuratie
+# Config
 # ------------------------------------------------------------------------------
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "michiel")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "CHANGE_ME")  # Zet dit in Render
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "CHANGE_ME")  # zet in Render
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "your-store.myshopify.com")
 
-# Externe timeouts / batching
 HTTP_TIMEOUT = 60
 OPENAI_TIMEOUT = 120
 BATCH_SIZE = 20
+# Shopify Admin GraphQL versie (mag recenter)
+SHOPIFY_API_VER = "2025-07"
 
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
 
 def require_login(fn):
-    """Decorator om /login te vereisen voor dashboard en API-routes."""
     def wrapper(*args, **kwargs):
         if not session.get("logged_in"):
             return redirect("/login")
@@ -73,8 +76,74 @@ def shopify_headers(token: str) -> Dict[str, str]:
     }
 
 
+def _respect_shopify_limit(resp: Optional[requests.Response]) -> None:
+    """
+    Shopify heeft ±2 req/s. Als header 'Retry-After' aanwezig is, respecteer die.
+    Anders een korte sleep om niet te pieken.
+    """
+    if resp is not None:
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            try:
+                wait = max(0.0, float(ra))
+                time.sleep(wait)
+                return
+            except Exception:
+                pass
+    # veilige default tussen 0.55–0.75s
+    time.sleep(0.65 + random.random() * 0.1)
+
+
+def _request_with_retry(method: str, url: str, *,
+                        headers: Dict[str, str],
+                        params: Dict[str, Any] | None = None,
+                        json_body: Dict[str, Any] | None = None,
+                        max_retries: int = 6,
+                        timeout: int = HTTP_TIMEOUT) -> requests.Response:
+    """
+    Doet Shopify-call met retries op 429/5xx en respecteert Retry-After.
+    Exponentiële backoff met jitter.
+    """
+    last_exc = None
+    backoff = 0.8
+    for attempt in range(1, max_retries + 1):
+        try:
+            if method == "GET":
+                resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+            elif method == "POST":
+                resp = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+            else:
+                raise ValueError("Unsupported method")
+
+            if resp.status_code in (429, 430) or resp.status_code >= 500:
+                # Respecteer Retry-After, dan backoff
+                _respect_shopify_limit(resp)
+                if attempt == max_retries:
+                    resp.raise_for_status()
+                else:
+                    # extra backoff zodat we niet blijven hameren
+                    time.sleep(backoff + random.random() * 0.3)
+                    backoff *= 1.6
+                    continue
+
+            resp.raise_for_status()
+            # kleine pauze na succesvolle call om 2 rps niet te overschrijden
+            _respect_shopify_limit(resp)
+            return resp
+
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt == max_retries:
+                raise
+            time.sleep(backoff + random.random() * 0.4)
+            backoff *= 1.6
+
+    # zou hier nooit komen
+    raise last_exc if last_exc else RuntimeError("Onbekende request-fout")
+
+
 def paged_shopify_get(path: str, token: str, limit: int = 250, params: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
-    """Haalt alle pagina's op voor een REST endpoint dat 'since_id' ondersteunt."""
+    """Haalt alle pagina's op voor REST endpoints met since_id, met retries en rate limiting."""
     params = dict(params or {})
     params["limit"] = min(limit, 250)
     since_id, out = 0, []
@@ -82,8 +151,7 @@ def paged_shopify_get(path: str, token: str, limit: int = 250, params: Dict[str,
     while True:
         params["since_id"] = since_id
         url = f"https://{SHOPIFY_STORE_DOMAIN}{path}"
-        r = requests.get(url, headers=shopify_headers(token), params=params, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
+        r = _request_with_retry("GET", url, headers=shopify_headers(token), params=params)
         data = r.json()
 
         key = None
@@ -115,13 +183,9 @@ def shopify_graphql_update_product(
     seo_title: str,
     seo_desc: str,
 ) -> Dict[str, Any]:
-    """
-    Updatet producttitel, beschrijving (HTML) en SEO (title/description) via GraphQL productUpdate.
-    Benodigde scopes: write_products (en read_products als je vooraf leest).
-    """
+    """GraphQL productUpdate met retries + rate limiting."""
     gid = f"gid://shopify/Product/{int(product_id_int)}"
-    # Gebruik recente Admin API; deze is veilig (kan ook 2025-01)
-    url = f"https://{store_domain}/admin/api/2025-07/graphql.json"
+    url = f"https://{store_domain}/admin/api/{SHOPIFY_API_VER}/graphql.json"
 
     mutation = """
     mutation productSeoAndDesc($input: ProductInput!) {
@@ -135,40 +199,33 @@ def shopify_graphql_update_product(
     variables = {
         "input": {
             "id": gid,
-            "title": new_title,                    # we overschrijven de titel
-            "descriptionHtml": new_desc_html,      # HTML toegestaan
-            "seo": {
-                "title": seo_title,                # beide velden tegelijk meesturen
-                "description": seo_desc
-            }
+            "title": new_title,
+            "descriptionHtml": new_desc_html,
+            "seo": {"title": seo_title, "description": seo_desc},
         }
     }
 
-    r = requests.post(
+    resp = _request_with_retry(
+        "POST",
         url,
-        headers={"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"},
-        json={"query": mutation, "variables": variables},
-        timeout=HTTP_TIMEOUT,
+        headers=shopify_headers(access_token),
+        json_body={"query": mutation, "variables": variables},
     )
-    r.raise_for_status()
-    data = r.json()
+    data = resp.json()
 
-    # GraphQL fouten of userErrors afvangen
-    if data.get("errors") or (data.get("data", {}).get("productUpdate", {}).get("userErrors")):
-        raise RuntimeError(f"Shopify GraphQL error: {data}")
+    errs = data.get("errors") or data.get("data", {}).get("productUpdate", {}).get("userErrors")
+    if errs:
+        raise RuntimeError(f"Shopify GraphQL error: {errs}")
 
     return data["data"]["productUpdate"]["product"]
 
 
 def split_ai_output(text: str) -> Dict[str, str]:
-    """
-    Probeert AI-output te splitsen in titel/body/meta_title/meta_description.
-    Werkt met marker-woorden en valt terug op blokken per paragraaf.
-    """
+    """Splits AI-output in titel/body/meta_title/meta_description (met fallback)."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     blob = "\n".join(lines)
 
-    def take(candidates: Iterable[str]) -> str | None:
+    def take(candidates: Iterable[str]) -> Optional[str]:
         for a in candidates:
             if a.lower() in blob.lower():
                 return a
@@ -188,12 +245,12 @@ def split_ai_output(text: str) -> Dict[str, str]:
             if start == -1:
                 return ""
             start += len(start_marker)
-            end_positions: List[int] = []
+            ends: List[int] = []
             for m in end_markers:
                 p = blob.lower().find(m.lower(), start)
                 if p != -1:
-                    end_positions.append(p)
-            end = min(end_positions) if end_positions else len(blob)
+                    ends.append(p)
+            end = min(ends) if ends else len(blob)
             return blob[start:end].strip().strip("-:")
 
         title = section(markers["title"], [markers["body"], markers["meta_title"], markers["meta_desc"], "\n\n"])
@@ -215,7 +272,7 @@ def split_ai_output(text: str) -> Dict[str, str]:
     }
 
 # ------------------------------------------------------------------------------
-# HTML (inline, zonder templating)
+# HTML
 # ------------------------------------------------------------------------------
 
 INDEX_HTML = '''<!doctype html><html lang="nl"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Shopify SEO Optimizer</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:24px;background:#0b1020;color:#eef}.card{max-width:880px;margin:0 auto;background:#121735;padding:20px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}h1{margin-top:0}label{display:block;margin:12px 0 8px}input,textarea,select{width:100%;padding:12px;border-radius:10px;border:1px solid #2a335a;background:#0f1430;color:#eef}button{padding:12px 16px;border:0;border-radius:12px;background:#4f7dff;color:white;font-weight:600;cursor:pointer}.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}.muted{opacity:.85}.status{margin-top:14px;white-space:pre-wrap}</style></head><body><div class="card"><h1>Shopify SEO Optimizer</h1><p class="muted">Log in om door te gaan.</p><form method="post" action="/login"><label>Gebruikersnaam</label><input name="username" placeholder="michiel" required /><label>Wachtwoord</label><input name="password" type="password" required /><div style="margin-top:12px"><button type="submit">Inloggen</button></div></form></div></body></html>'''
@@ -282,14 +339,11 @@ def logout():
 @app.route("/api/collections", methods=["POST"])
 @require_login
 def api_collections():
-    # Belangrijk: global vóór gebruik declareren
-    global SHOPIFY_STORE_DOMAIN
+    global SHOPIFY_STORE_DOMAIN  # eerst declareren
 
     payload = request.get_json(force=True)
     store = payload.get("store") or SHOPIFY_STORE_DOMAIN
     token = payload.get("token")
-
-    # Bewaar eventueel nieuwe store-URL voor de rest van de sessie
     SHOPIFY_STORE_DOMAIN = store
 
     if not token:
@@ -319,7 +373,7 @@ def api_optimize():
         try:
             all_product_ids: List[int] = []
 
-            # 1) Producten verzamelen uit gekozen collecties
+            # 1) Verzamel producten
             for cid in collection_ids:
                 collects = paged_shopify_get(
                     "/admin/api/2024-07/collects.json", token, params={"collection_id": cid}
@@ -339,13 +393,12 @@ def api_optimize():
                 batch_ids = all_product_ids[i : i + BATCH_SIZE]
                 ids_param = ",".join(map(str, batch_ids))
                 url = f"https://{store}/admin/api/2024-07/products.json"
-                r = requests.get(
+                r = _request_with_retry(
+                    "GET",
                     url,
                     headers=shopify_headers(token),
                     params={"ids": ids_param, "limit": 250},
-                    timeout=HTTP_TIMEOUT,
                 )
-                r.raise_for_status()
                 prods = r.json().get("products", [])
 
                 for p in prods:
@@ -379,7 +432,6 @@ def api_optimize():
                         Meta description: …
                         """
                     ).strip()
-
                     final_prompt = (user_prompt + "\n\n" + base_prompt).strip() if user_prompt else base_prompt
 
                     try:
@@ -387,11 +439,11 @@ def api_optimize():
                         out = openai_chat(api_key, sys, final_prompt, model=model)
                         pieces = split_ai_output(out)
 
-                        # 2b) Veilige fallbacks voor SEO-velden
+                        # 2b) Fallbacks voor SEO
                         seo_title = pieces.get("meta_title") or (pieces.get("title") or title)[:60]
                         seo_desc = pieces.get("meta_description") or (pieces.get("body_html") or body)[:155]
 
-                        # 2c) Shopify GraphQL update (title + descriptionHtml + SEO)
+                        # 2c) Shopify GraphQL update met retry/rate-limit
                         _ = shopify_graphql_update_product(
                             store_domain=store,
                             access_token=token,
@@ -405,8 +457,10 @@ def api_optimize():
                         processed += 1
                         yield f"✅ #{p['id']} bijgewerkt: {(pieces.get('title') or title)[:70]}\n"
 
+                        # 2d) extra ademruimte per product (veilig)
+                        time.sleep(0.35)
+
                     except Exception as e:
-                        # We loggen per product en gaan door met de rest
                         yield f"❌ Fout bij product #{p.get('id')}: {e}\n"
 
             yield f"\nKlaar. Totaal bijgewerkt: {processed}.\n"
@@ -418,9 +472,10 @@ def api_optimize():
 
 
 # ------------------------------------------------------------------------------
-# Dev entrypoint (niet gebruikt op Render; daar start je via Gunicorn)
+# Local run (Render gebruikt gunicorn)
 # ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
