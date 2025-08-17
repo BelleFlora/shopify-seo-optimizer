@@ -29,8 +29,7 @@ SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "your-store.myshop
 HTTP_TIMEOUT = 60
 OPENAI_TIMEOUT = 120
 BATCH_SIZE = 20
-# Shopify Admin GraphQL versie (mag recenter)
-SHOPIFY_API_VER = "2025-07"
+SHOPIFY_API_VER = "2025-07"  # mag recenter
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -47,7 +46,6 @@ def require_login(fn):
 
 def openai_chat(api_key: str, system_prompt: str, user_prompt: str,
                 model: str = "gpt-4o-mini", temperature: float = 0.7) -> str:
-    """Kleine wrapper rond OpenAI Chat Completions API."""
     url = "https://api.openai.com/v1/chat/completions"
     body = {
         "model": model,
@@ -77,10 +75,7 @@ def shopify_headers(token: str) -> Dict[str, str]:
 
 
 def _respect_shopify_limit(resp: Optional[requests.Response]) -> None:
-    """
-    Shopify heeft ±2 req/s. Als header 'Retry-After' aanwezig is, respecteer die.
-    Anders een korte sleep om niet te pieken.
-    """
+    """Respecteer Retry-After header; anders korte sleep om onder 2 rps te blijven."""
     if resp is not None:
         ra = resp.headers.get("Retry-After")
         if ra:
@@ -90,8 +85,7 @@ def _respect_shopify_limit(resp: Optional[requests.Response]) -> None:
                 return
             except Exception:
                 pass
-    # veilige default tussen 0.55–0.75s
-    time.sleep(0.65 + random.random() * 0.1)
+    time.sleep(0.65 + random.random() * 0.1)  # default rust
 
 
 def _request_with_retry(method: str, url: str, *,
@@ -100,10 +94,7 @@ def _request_with_retry(method: str, url: str, *,
                         json_body: Dict[str, Any] | None = None,
                         max_retries: int = 6,
                         timeout: int = HTTP_TIMEOUT) -> requests.Response:
-    """
-    Doet Shopify-call met retries op 429/5xx en respecteert Retry-After.
-    Exponentiële backoff met jitter.
-    """
+    """Shopify-call met retries op 429/5xx + backoff."""
     last_exc = None
     backoff = 0.8
     for attempt in range(1, max_retries + 1):
@@ -116,18 +107,14 @@ def _request_with_retry(method: str, url: str, *,
                 raise ValueError("Unsupported method")
 
             if resp.status_code in (429, 430) or resp.status_code >= 500:
-                # Respecteer Retry-After, dan backoff
                 _respect_shopify_limit(resp)
                 if attempt == max_retries:
                     resp.raise_for_status()
-                else:
-                    # extra backoff zodat we niet blijven hameren
-                    time.sleep(backoff + random.random() * 0.3)
-                    backoff *= 1.6
-                    continue
+                time.sleep(backoff + random.random() * 0.3)
+                backoff *= 1.6
+                continue
 
             resp.raise_for_status()
-            # kleine pauze na succesvolle call om 2 rps niet te overschrijden
             _respect_shopify_limit(resp)
             return resp
 
@@ -138,7 +125,6 @@ def _request_with_retry(method: str, url: str, *,
             time.sleep(backoff + random.random() * 0.4)
             backoff *= 1.6
 
-    # zou hier nooit komen
     raise last_exc if last_exc else RuntimeError("Onbekende request-fout")
 
 
@@ -339,8 +325,7 @@ def logout():
 @app.route("/api/collections", methods=["POST"])
 @require_login
 def api_collections():
-    global SHOPIFY_STORE_DOMAIN  # eerst declareren
-
+    global SHOPIFY_STORE_DOMAIN
     payload = request.get_json(force=True)
     store = payload.get("store") or SHOPIFY_STORE_DOMAIN
     token = payload.get("token")
@@ -435,47 +420,8 @@ def api_optimize():
                     final_prompt = (user_prompt + "\n\n" + base_prompt).strip() if user_prompt else base_prompt
 
                     try:
-                        # 2a) AI-tekst genereren
                         out = openai_chat(api_key, sys, final_prompt, model=model)
                         pieces = split_ai_output(out)
 
-                        # 2b) Fallbacks voor SEO
                         seo_title = pieces.get("meta_title") or (pieces.get("title") or title)[:60]
-                        seo_desc = pieces.get("meta_description") or (pieces.get("body_html") or body)[:155]
-
-                        # 2c) Shopify GraphQL update met retry/rate-limit
-                        _ = shopify_graphql_update_product(
-                            store_domain=store,
-                            access_token=token,
-                            product_id_int=p["id"],
-                            new_title=(pieces.get("title") or title),
-                            new_desc_html=(pieces.get("body_html") or body),
-                            seo_title=seo_title,
-                            seo_desc=seo_desc,
-                        )
-
-                        processed += 1
-                        yield f"✅ #{p['id']} bijgewerkt: {(pieces.get('title') or title)[:70]}\n"
-
-                        # 2d) extra ademruimte per product (veilig)
-                        time.sleep(0.35)
-
-                    except Exception as e:
-                        yield f"❌ Fout bij product #{p.get('id')}: {e}\n"
-
-            yield f"\nKlaar. Totaal bijgewerkt: {processed}.\n"
-
-        except Exception as e:
-            yield f"⚠️ Beëindigd met fout: {e}\n"
-
-    return Response(generate(), mimetype="text/plain")
-
-
-# ------------------------------------------------------------------------------
-# Local run (Render gebruikt gunicorn)
-# ------------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
+                        seo_desc = pieces.get("meta
