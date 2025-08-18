@@ -2,6 +2,7 @@
 # Belle Flora SEO Optimizer – Flask (Render/Railway ready)
 # NL UI • Login via env vars • Server-side OpenAI key • Collectie-selectie • Batching • Backoff • GraphQL updates
 # Vaste h3-secties + zwart-wit symbolen: ☀ (Lichtbehoefte), ∿ (Waterbehoefte), ⌂ (Standplaats), ☠ (Giftigheid)
+# Nieuw: automatisch metafields invullen (alleen als ontbrekend): specs.height_cm, specs.pot_diameter_cm
 
 import os, json, time, textwrap, html, re
 from typing import List, Dict, Any
@@ -217,6 +218,97 @@ def shopify_graphql_update_product(store_domain: str, access_token: str, product
     if data.get("errors") or user_errors:
         raise RuntimeError(f"Shopify GraphQL error: {data}")
     return data["data"]["productUpdate"]["product"]
+
+
+# ---------- Metafields helpers (nieuw) ----------
+
+DIM_HEIGHT_RE = re.compile(r"(?:↕\s*)?(\d{1,3})\s*cm", re.I)   # match “↕150cm”, “150 cm”
+DIM_POT_RE    = re.compile(r"(?:[⌀ØO]\s*)?(\d{1,3})\s*(?:cm)?\b", re.I)  # match “⌀27”, “Ø 27”, “O27”, “27 cm”
+
+def parse_dimensions_from_text(title: str, body_html: str) -> Dict[str, str]:
+    """Probeer hoogte/potdiameter uit titel/tekst te halen. Return strings (bv. '150')."""
+    # Strip HTML naar tekst
+    text_body = re.sub(r"<[^>]+>", " ", body_html or "", flags=re.I)
+    text = f"{title or ''}\n{text_body}"
+
+    height = None
+    pot = None
+
+    # Hoogte – geef voorrang aan '↕'
+    m = re.search(r"↕\s*(\d{1,3})\s*cm", text)
+    if m:
+        height = m.group(1)
+    else:
+        m = DIM_HEIGHT_RE.search(text)
+        if m:
+            height = m.group(1)
+
+    # Potdiameter – geef voorrang aan '⌀' / 'Ø'
+    m = re.search(r"[⌀Ø]\s*(\d{1,3})\s*cm?", text)
+    if m:
+        pot = m.group(1)
+    else:
+        # fallback: losse getallen met O/Ø/⌀ of eindigend op cm
+        m = DIM_POT_RE.search(text)
+        if m:
+            pot = m.group(1)
+
+    out = {}
+    if height: out["height_cm"] = height
+    if pot: out["pot_diameter_cm"] = pot
+    return out
+
+
+def shopify_product_metafields(token: str, store_domain: str, product_id_int: int, namespace: str = "specs") -> Dict[str, Any]:
+    """Lees bestaande metafields (height_cm, pot_diameter_cm) via één GraphQL query (aliases)."""
+    gid = f"gid://shopify/Product/{int(product_id_int)}"
+    url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
+    query = """
+    query getMeta($id: ID!, $ns: String!) {
+      product(id: $id) {
+        id
+        h: metafield(namespace: $ns, key: "height_cm") { value }
+        d: metafield(namespace: $ns, key: "pot_diameter_cm") { value }
+      }
+    }"""
+    variables = {"id": gid, "ns": namespace}
+    data = shopify_post_graphql_with_backoff(url, token, {"query": query, "variables": variables})
+    p = (data.get("data") or {}).get("product") or {}
+    h = (p.get("h") or {}).get("value")
+    d = (p.get("d") or {}).get("value")
+    return {"height_cm": h, "pot_diameter_cm": d}
+
+
+def shopify_set_product_metafields(token: str, store_domain: str, product_id_int: int,
+                                   values: Dict[str, str], namespace: str = "specs") -> None:
+    """Schrijf 1..n metafields met metafieldsSet. Verwacht dict met {key: value}."""
+    if not values:
+        return
+    gid = f"gid://shopify/Product/{int(product_id_int)}"
+    url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
+    mutation = """
+    mutation setMeta($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields { key value }
+        userErrors { field message }
+      }
+    }"""
+    mf_inputs = []
+    for k, v in values.items():
+        mf_inputs.append({
+            "ownerId": gid,
+            "namespace": namespace,
+            "key": k,
+            "type": "single_line_text_field",
+            "value": str(v)
+        })
+    payload = {"query": mutation, "variables": {"metafields": mf_inputs}}
+    data = shopify_post_graphql_with_backoff(url, token, payload)
+    ue = (data.get("data", {}).get("metafieldsSet", {}) or {}).get("userErrors", [])
+    if ue:
+        raise RuntimeError(f"metafieldsSet userErrors: {ue}")
+
+# ---------- Einde Metafields helpers ----------
 
 
 def split_ai_output(text: str) -> Dict[str, str]:
@@ -568,6 +660,7 @@ def api_optimize():
                         out = openai_chat_with_backoff(sys_prompt, final_prompt, model=model, temperature=DEFAULT_TEMPERATURE)
                         pieces = split_ai_output(out)
 
+                        # 4a) Shopify: titel/HTML/SEO updaten
                         _ = shopify_graphql_update_product(
                             store_domain=store,
                             access_token=token,
@@ -577,6 +670,23 @@ def api_optimize():
                             seo_title=pieces['meta_title'],
                             seo_desc=pieces['meta_description'],
                         )
+
+                        # 4b) Metafields bijwerken (alleen als ontbrekend)
+                        try:
+                            existing = shopify_product_metafields(token, store, pid)
+                            parsed = parse_dimensions_from_text(pieces['title'] or title, pieces['body_html'] or body_html)
+                            missing: Dict[str, str] = {}
+                            if not (existing.get("height_cm") or "") and parsed.get("height_cm"):
+                                missing["height_cm"] = parsed["height_cm"]
+                            if not (existing.get("pot_diameter_cm") or "") and parsed.get("pot_diameter_cm"):
+                                missing["pot_diameter_cm"] = parsed["pot_diameter_cm"]
+                            if missing:
+                                shopify_set_product_metafields(token, store, pid, missing)
+                                yield f"   • Metafields aangevuld: {missing}\n"
+                            else:
+                                yield "   • Metafields al aanwezig of geen waarden gevonden\n"
+                        except Exception as me:
+                            yield f"   • Metafields overslaan (fout): {me}\n"
 
                         processed += 1
                         short_title = (pieces['title'] or title)[:120]
