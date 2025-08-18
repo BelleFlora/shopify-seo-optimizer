@@ -1,11 +1,11 @@
 # app.py
 # Belle Flora SEO Optimizer – Flask (Render/Railway ready)
 # NL UI • Login via env vars • Server-side OpenAI key • Collectie-selectie • Batching • Backoff • GraphQL updates
-# Metafields: auto-detectie van jouw definities (namespace/key/type) + fallback + mirroring
-# Schrijft standaard naar zowel "Hoogte (cm)" als "Hoogte" (indien aanwezig als product-metafields)
+# Metafields: auto-detectie (namespace/key/type) + fallback + mirroring
+# Transactiefocus: koopwoorden in meta's + USP-lijst (default: Gratis verzending vanaf €49)
 
 import os, json, time, textwrap, html, re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from flask import Flask, request, session, redirect, Response, jsonify
 import requests
 import urllib.request
@@ -42,6 +42,13 @@ META_DEBUG_MAPPING     = os.environ.get('META_DEBUG_MAPPING', '1') not in ('0', 
 META_MIRROR_MAX_HEIGHT = int(os.environ.get('META_MIRROR_MAX_HEIGHT', '2'))  # schrijf naar max 2 hoogtevelden
 META_MIRROR_MAX_DIAM   = int(os.environ.get('META_MIRROR_MAX_DIAM', '1'))    # schrijf naar max 1 diameterveld
 
+# Transactiefocus (koopwoorden in meta's) – standaard UIT, USP's inclusief €49-drempel
+TRANSACTIONAL_MODE = os.environ.get('TRANSACTIONAL_MODE', '0') not in ('0', 'false', 'False')
+TRANSACTIONAL_CLAIMS = [s.strip() for s in os.environ.get(
+    'TRANSACTIONAL_CLAIMS',
+    'Gratis verzending vanaf €49|Vandaag besteld, snel in huis|30 dagen retour|Lokale kweker|Verse kwaliteit'
+).split('|') if s.strip()]
+
 # -------------------------------
 # Helpers
 # -------------------------------
@@ -55,9 +62,11 @@ def require_login(fn):
     return wrapper
 
 
-def build_system_prompt() -> str:
-    """Vaste system prompt – titel-format + vaste secties + zwart-wit symbolen (geen bullets)."""
-    return (
+def build_system_prompt(txn_mode: bool = False, txn_usps: Optional[List[str]] = None) -> str:
+    """System prompt – titel-format + vaste secties + optionele transactiefocus voor meta's."""
+    txn_usps = [u for u in (txn_usps or []) if u]
+
+    base = (
         "Je bent een ervaren Nederlandstalige SEO-copywriter voor een plantenwebshop (Belle Flora). "
         "Schrijf klantgericht, natuurlijk en informatief. Optimaliseer subtiel voor SEO zonder keyword stuffing. "
         "Gebruik correcte plantennamen en wees feitelijk; verzin geen gegevens.\n\n"
@@ -74,29 +83,43 @@ def build_system_prompt() -> str:
         "  • Gebruik het ‘–’ (en dash) tussen blokken en de symbolen ↕ en ⌀.\n\n"
 
         "BESCHRIJVING – HTML-LAYOUT (vast stramien):\n"
-        "  • Gebruik altijd exact deze secties met <h3> kopjes:\n"
-        "      1) <h3>Beschrijving</h3> gevolgd door 1 korte paragraaf (<p>…) met 2–3 zinnen.\n"
-        "      2) <h3>Eigenschappen & behoeften</h3> gevolgd door 4 regels (géén bullets, géén <ul>):\n"
-        "         <p>☀ Lichtbehoefte: …</p>\n"
-        "         <p>∿ Waterbehoefte: …</p>\n"
-        "         <p>⌂ Standplaats: …</p>\n"
-        "         <p>☠ Giftigheid: …</p>\n"
-        "     – Dit zijn zwart-wit Unicode symbolen (geen gekleurde emoji). Laat de 4 regels altijd staan; "
-        "       als informatie ontbreekt, schrijf ‘Onbekend’.\n"
-        "  • Optioneel kun je afsluiten met 1 extra <p> met een korte verzorgingstip.\n"
-        "  • Gebruik uitsluitend schone, eenvoudige HTML (<h3>, <p>, <strong>, <em>); geen <ul>/<li>, geen inline-styles, geen H1.\n\n"
+        "  • Gebruik exact deze secties met <h3>-kopjes en 4 regels zonder bullets:\n"
+        "    <h3>Beschrijving</h3> + 1 korte alinea; daarna\n"
+        "    <h3>Eigenschappen & behoeften</h3>\n"
+        "    <p>☀ Lichtbehoefte: …</p>\n"
+        "    <p>∿ Waterbehoefte: …</p>\n"
+        "    <p>⌂ Standplaats: …</p>\n"
+        "    <p>☠ Giftigheid: …</p>\n"
+        "  • Alleen schone HTML (<h3>, <p>, <strong>, <em>).\n\n"
 
         "SEO-UITGANGSPUNTEN:\n"
-        "  • Verwerk relevante zoekwoorden (kamerplanten/tuinplanten; voor ‘Boeketten’: bloemen/boeketten) natuurlijk in titel en tekst.\n"
         "  • Lever ook een meta title (≤60 tekens) en meta description (≤155 tekens). Kort, duidelijk, klik-waardig.\n"
         "  • Elke tekst moet uniek zijn per product.\n\n"
+    )
 
-        "OUTPUTFORMAAT (belangrijk—exact deze labels gebruiken):\n"
+    txn = ""
+    if txn_mode:
+        usps = " • ".join(txn_usps) if txn_usps else ""
+        txn = (
+            "TRANSACTIONELE FOCUS VOOR META-TAGS:\n"
+            "  • Gebruik koopgerichte trefwoorden (bijv. Koop, Bestel, Shop, Online, Nu) waar natuurlijk.\n"
+            "  • Meta title (≤60): begin waar mogelijk met een koopwoord + productnaam; merk aan het eind mag als er ruimte is (| Belle Flora). "
+            "Geen schreeuwerige hoofdletters of uitroeptekens.\n"
+            "  • Meta description (≤155): voeg 1–2 korte USP's toe en een subtiele call-to-action (Bestel nu / Shop online). "
+            "Gebruik alleen USP's uit de volgende lijst en verzin niets: "
+            f"{usps if usps else '[geen USP-lijst opgegeven]'}\n"
+            "  • Doe geen prijs- of leverbelofte tenzij expliciet in de USP-lijst vermeld.\n\n"
+        )
+
+    closing = (
+        "OUTPUTFORMAAT (exact deze labels gebruiken):\n"
         "Nieuwe titel: …\n\n"
         "Beschrijving: … (HTML)\n\n"
         "Meta title: …\n"
         "Meta description: …\n"
     )
+
+    return base + txn + closing
 
 
 def openai_chat_with_backoff(system_prompt: str, user_prompt: str, model: str = DEFAULT_MODEL,
@@ -273,7 +296,7 @@ def _fetch_product_metafield_definitions(token: str, store_domain: str) -> List[
 
 
 def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[str, Any]]:
-    """Geef gescoorde lijst kandidaten terug; prefer 'Hoogte (cm)' & 'Hoogte' (en diameter-varianten)."""
+    """Geef gescoorde lijst kandidaten; prefer 'Hoogte (cm)' & 'Hoogte' (en diameter-varianten)."""
     hints = [h.strip().lower() for h in hints if h.strip()]
     out = []
     for d in defs:
@@ -529,7 +552,7 @@ def split_ai_output(text: str) -> Dict[str, str]:
     }
 
 # -------------------------------
-# UI (HTML)  (placeholders [[STORE]], [[MODEL]], [[BATCH]], [[DELAY]])
+# UI (HTML)  (placeholders [[STORE]], [[MODEL]], [[BATCH]], [[DELAY]], [[TXNUSPS]], [[TXNCHECKED]])
 # -------------------------------
 
 LOGIN_HTML = '''<!doctype html><html lang="nl"><head>
@@ -592,6 +615,17 @@ small{opacity:.85}
       <input id="prompt" placeholder="Extra richtlijnen..." />
     </div>
   </div>
+
+  <div class="row">
+    <div>
+      <label><input type="checkbox" id="txn"> Transactiefocus (koopwoorden in meta’s)</label>
+    </div>
+    <div>
+      <label>USP’s voor meta’s (scheid met |)</label>
+      <input id="txn_usps" placeholder="Gratis verzending vanaf €49|Vandaag besteld, snel in huis|30 dagen retour" value="[[TXNUSPS]]" />
+    </div>
+  </div>
+
   <div style="margin-top:10px">
     <button onclick="loadCollections()">Collecties laden</button>
     <span id="cstatus" class="pill">Nog niet geladen</span>
@@ -616,6 +650,11 @@ small{opacity:.85}
 const qs = s => document.querySelector(s);
 function setLog(t){qs('#status').textContent = t}
 function addLog(t){qs('#status').textContent += '\\n' + t}
+
+const DEFAULT_TXN_CHECKED = [[TXNCHECKED]]; // boolean literal (true/false)
+window.addEventListener('DOMContentLoaded', () => {
+  qs('#txn').checked = DEFAULT_TXN_CHECKED;
+});
 
 async function loadCollections(){
   setLog('Collecties laden…');
@@ -651,7 +690,9 @@ async function optimizeSelected(){
       token: qs('#token').value.trim(),
       model: qs('#model').value.trim() || 'gpt-4o-mini',
       prompt: qs('#prompt').value,
-      collection_ids: ids
+      collection_ids: ids,
+      txn: qs('#txn').checked,
+      txn_usps: qs('#txn_usps').value
     })
   });
   const rd = res.body.getReader(); const dec = new TextDecoder();
@@ -692,7 +733,9 @@ def dashboard():
             .replace('[[STORE]]', SHOPIFY_STORE_DOMAIN)
             .replace('[[MODEL]]', DEFAULT_MODEL)
             .replace('[[BATCH]]', str(BATCH_SIZE))
-            .replace('[[DELAY]]', f"{DELAY_PER_PRODUCT:.1f}"))
+            .replace('[[DELAY]]', f"{DELAY_PER_PRODUCT:.1f}")
+            .replace('[[TXNUSPS]]', " | ".join(TRANSACTIONAL_CLAIMS))
+            .replace('[[TXNCHECKED]]', 'true' if TRANSACTIONAL_MODE else 'false'))
     return Response(html, mimetype='text/html')
 
 
@@ -732,12 +775,20 @@ def api_optimize():
     user_prompt_extra = (payload.get('prompt') or '').strip()
     collection_ids = payload.get('collection_ids') or []
 
+    # Transactiefocus-opties
+    if 'txn' in payload:
+        txn_mode = bool(payload.get('txn'))
+    else:
+        txn_mode = TRANSACTIONAL_MODE
+    txn_usps_input = payload.get('txn_usps') or ""
+    txn_usps = [s.strip() for s in txn_usps_input.split('|') if s.strip()] or TRANSACTIONAL_CLAIMS
+
     if not token:
         return Response("Shopify token ontbreekt.\n", mimetype='text/plain', status=400)
     if not OPENAI_API_KEY:
         return Response("OPENAI_API_KEY ontbreekt in de server-omgeving.\n", mimetype='text/plain', status=500)
 
-    sys_prompt = build_system_prompt()
+    sys_prompt = build_system_prompt(txn_mode=txn_mode, txn_usps=txn_usps)
 
     def generate():
         try:
@@ -762,7 +813,7 @@ def api_optimize():
                 all_product_ids = [int(p['id']) for p in prods]
                 yield f"Geen collectie geselecteerd – hele shop: {len(all_product_ids)} producten gevonden\n"
 
-            yield f"Instellingen: batch={BATCH_SIZE}, delay={DELAY_PER_PRODUCT:.1f}s, model={model} (server-side)\n"
+            yield f"Instellingen: batch={BATCH_SIZE}, delay={DELAY_PER_PRODUCT:.1f}s, model={model} (server-side), transactiefocus={'aan' if txn_mode else 'uit'}\n"
 
             # 2) In batches productdetails ophalen
             processed = 0
