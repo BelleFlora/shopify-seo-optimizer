@@ -2,7 +2,7 @@
 # Belle Flora SEO Optimizer – Flask (Render/Railway ready)
 # NL UI • Login via env vars • Server-side OpenAI key • Collectie-selectie • Batching • Backoff • GraphQL updates
 # Vaste h3-secties + zwart-wit symbolen: ☀ (Lichtbehoefte), ∿ (Waterbehoefte), ⌂ (Standplaats), ☠ (Giftigheid)
-# Nieuw: automatisch metafields invullen (alleen als ontbrekend): specs.height_cm, specs.pot_diameter_cm
+# Nieuw: automatisch metafields invullen (alleen als ontbrekend) en auto-detectie van jouw namespace/keys.
 
 import os, json, time, textwrap, html, re
 from typing import List, Dict, Any
@@ -31,6 +31,11 @@ BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '8'))                # aantal prod
 DELAY_PER_PRODUCT = float(os.environ.get('DELAY_SECONDS', '2.5'))  # pauze tussen producten
 OPENAI_MAX_RETRIES = int(os.environ.get('OPENAI_MAX_RETRIES', '4'))
 SHOPIFY_MAX_RETRIES = int(os.environ.get('SHOPIFY_MAX_RETRIES', '4'))
+
+# Metafields-config (kan je override’n via omgeving)
+META_NAMESPACE_DEFAULT = os.environ.get('META_NAMESPACE_DEFAULT', 'specs')
+META_HEIGHT_KEYS_HINT  = os.environ.get('META_HEIGHT_KEYS_HINT', 'hoogte,height').split(',')
+META_DIAM_KEYS_HINT    = os.environ.get('META_DIAM_KEYS_HINT', 'diameter,pot,ø,⌀').split(',')
 
 # -------------------------------
 # Helpers
@@ -220,21 +225,23 @@ def shopify_graphql_update_product(store_domain: str, access_token: str, product
     return data["data"]["productUpdate"]["product"]
 
 
-# ---------- Metafields helpers (nieuw) ----------
+# ---------- Metafields helpers (auto-detect) ----------
 
-DIM_HEIGHT_RE = re.compile(r"(?:↕\s*)?(\d{1,3})\s*cm", re.I)   # match “↕150cm”, “150 cm”
-DIM_POT_RE    = re.compile(r"(?:[⌀ØO]\s*)?(\d{1,3})\s*(?:cm)?\b", re.I)  # match “⌀27”, “Ø 27”, “O27”, “27 cm”
+# Parse-regexen
+DIM_HEIGHT_RE = re.compile(r"(?:↕\s*)?(\d{1,3})\s*cm", re.I)          # “↕150cm”, “150 cm”
+DIM_POT_RE    = re.compile(r"(?:[⌀ØO]\s*)?(\d{1,3})\s*(?:cm)?\b", re.I)  # “⌀27”, “Ø 27”, “27 cm”
+
+# Cache: per store de mapping naar jouw eigen definities
+_META_MAP_CACHE: Dict[str, Dict[str, str]] = {}  # {"height_ns":..., "height_key":..., "diam_ns":..., "diam_key":...}
 
 def parse_dimensions_from_text(title: str, body_html: str) -> Dict[str, str]:
-    """Probeer hoogte/potdiameter uit titel/tekst te halen. Return strings (bv. '150')."""
-    # Strip HTML naar tekst
+    """Haal hoogte & potdiameter uit titel/body (strings, bv. '150')."""
     text_body = re.sub(r"<[^>]+>", " ", body_html or "", flags=re.I)
     text = f"{title or ''}\n{text_body}"
 
     height = None
     pot = None
 
-    # Hoogte – geef voorrang aan '↕'
     m = re.search(r"↕\s*(\d{1,3})\s*cm", text)
     if m:
         height = m.group(1)
@@ -243,12 +250,10 @@ def parse_dimensions_from_text(title: str, body_html: str) -> Dict[str, str]:
         if m:
             height = m.group(1)
 
-    # Potdiameter – geef voorrang aan '⌀' / 'Ø'
     m = re.search(r"[⌀Ø]\s*(\d{1,3})\s*cm?", text)
     if m:
         pot = m.group(1)
     else:
-        # fallback: losse getallen met O/Ø/⌀ of eindigend op cm
         m = DIM_POT_RE.search(text)
         if m:
             pot = m.group(1)
@@ -259,49 +264,134 @@ def parse_dimensions_from_text(title: str, body_html: str) -> Dict[str, str]:
     return out
 
 
-def shopify_product_metafields(token: str, store_domain: str, product_id_int: int, namespace: str = "specs") -> Dict[str, Any]:
-    """Lees bestaande metafields (height_cm, pot_diameter_cm) via één GraphQL query (aliases)."""
+def _fetch_product_metafield_definitions(token: str, store_domain: str) -> List[Dict[str, Any]]:
+    url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
+    query = """
+    query defs {
+      metafieldDefinitions(ownerType: PRODUCT, first: 250) {
+        edges {
+          node {
+            id
+            name
+            namespace
+            key
+            type { name }
+          }
+        }
+      }
+    }"""
+    data = shopify_post_graphql_with_backoff(url, token, {"query": query})
+    edges = (((data or {}).get("data") or {}).get("metafieldDefinitions") or {}).get("edges") or []
+    return [e["node"] for e in edges if "node" in e]
+
+
+def _select_field(defs: List[Dict[str, Any]], hints: List[str]) -> Dict[str, str] | None:
+    """Kies definitie waarvan naam/key een hint bevat (case-insensitive)."""
+    def _match(s: str) -> bool:
+        s = (s or "").lower()
+        return any(h.strip().lower() in s for h in hints)
+
+    best = None
+    for d in defs:
+        name = d.get("name") or ""
+        key  = d.get("key") or ""
+        if _match(name) or _match(key):
+            # voorkeur: single_line_text_field
+            tname = (((d.get("type") or {}).get("name")) or "").lower()
+            score = 2 if "single_line_text_field" in tname else 1
+            best = max([best, (score, d)], key=lambda x: (-1 if x is None else x[0])) if best else (score, d)
+    return best[1] if best else None
+
+
+def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, str]:
+    """Bepaal (en cache) namespace/key voor hoogte & diameter, op basis van je shop-definities."""
+    cache_key = store_domain
+    if cache_key in _META_MAP_CACHE:
+        return _META_MAP_CACHE[cache_key]
+
+    defs = _fetch_product_metafield_definitions(token, store_domain)
+    height_def = _select_field(defs, META_HEIGHT_KEYS_HINT)
+    diam_def   = _select_field(defs, META_DIAM_KEYS_HINT)
+
+    meta_map = {
+        # Fallback naar ‘specs/height_cm’ en ‘specs/pot_diameter_cm’ als niets matcht
+        "height_ns": META_NAMESPACE_DEFAULT, "height_key": "height_cm",
+        "diam_ns":   META_NAMESPACE_DEFAULT, "diam_key":   "pot_diameter_cm",
+    }
+    if height_def:
+        meta_map["height_ns"]  = height_def["namespace"]
+        meta_map["height_key"] = height_def["key"]
+    if diam_def:
+        meta_map["diam_ns"]  = diam_def["namespace"]
+        meta_map["diam_key"] = diam_def["key"]
+
+    _META_MAP_CACHE[cache_key] = meta_map
+    return meta_map
+
+
+def shopify_product_metafields(token: str, store_domain: str, product_id_int: int) -> Dict[str, Any]:
+    """Lees huidige waarden volgens auto-detectie."""
+    meta_map = _ensure_meta_map(token, store_domain)
     gid = f"gid://shopify/Product/{int(product_id_int)}"
     url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
     query = """
-    query getMeta($id: ID!, $ns: String!) {
+    query getMeta($id: ID!, $nsH: String!, $keyH: String!, $nsD: String!, $keyD: String!) {
       product(id: $id) {
         id
-        h: metafield(namespace: $ns, key: "height_cm") { value }
-        d: metafield(namespace: $ns, key: "pot_diameter_cm") { value }
+        h: metafield(namespace: $nsH, key: $keyH) { value }
+        d: metafield(namespace: $nsD, key: $keyD) { value }
       }
     }"""
-    variables = {"id": gid, "ns": namespace}
+    variables = {
+        "id": gid,
+        "nsH": meta_map["height_ns"], "keyH": meta_map["height_key"],
+        "nsD": meta_map["diam_ns"],   "keyD": meta_map["diam_key"],
+    }
     data = shopify_post_graphql_with_backoff(url, token, {"query": query, "variables": variables})
     p = (data.get("data") or {}).get("product") or {}
-    h = (p.get("h") or {}).get("value")
-    d = (p.get("d") or {}).get("value")
-    return {"height_cm": h, "pot_diameter_cm": d}
+    return {
+        "height_cm": ((p.get("h") or {}) or {}).get("value"),
+        "pot_diameter_cm": ((p.get("d") or {}) or {}).get("value"),
+    }
 
 
 def shopify_set_product_metafields(token: str, store_domain: str, product_id_int: int,
-                                   values: Dict[str, str], namespace: str = "specs") -> None:
-    """Schrijf 1..n metafields met metafieldsSet. Verwacht dict met {key: value}."""
+                                   values: Dict[str, str]) -> None:
+    """Schrijf metafields naar de auto-gedetecteerde namespace/key (alleen meegegeven keys)."""
     if not values:
         return
+    meta_map = _ensure_meta_map(token, store_domain)
     gid = f"gid://shopify/Product/{int(product_id_int)}"
     url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
     mutation = """
     mutation setMeta($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) {
-        metafields { key value }
+        metafields { namespace key value }
         userErrors { field message }
       }
     }"""
+
     mf_inputs = []
-    for k, v in values.items():
+    if "height_cm" in values and values["height_cm"]:
         mf_inputs.append({
             "ownerId": gid,
-            "namespace": namespace,
-            "key": k,
+            "namespace": meta_map["height_ns"],
+            "key": meta_map["height_key"],
             "type": "single_line_text_field",
-            "value": str(v)
+            "value": str(values["height_cm"])
         })
+    if "pot_diameter_cm" in values and values["pot_diameter_cm"]:
+        mf_inputs.append({
+            "ownerId": gid,
+            "namespace": meta_map["diam_ns"],
+            "key": meta_map["diam_key"],
+            "type": "single_line_text_field",
+            "value": str(values["pot_diameter_cm"])
+        })
+
+    if not mf_inputs:
+        return
+
     payload = {"query": mutation, "variables": {"metafields": mf_inputs}}
     data = shopify_post_graphql_with_backoff(url, token, payload)
     ue = (data.get("data", {}).get("metafieldsSet", {}) or {}).get("userErrors", [])
@@ -363,7 +453,6 @@ def split_ai_output(text: str) -> Dict[str, str]:
 
     # Body naar eenvoudige HTML als er geen tags in staan
     if body and not re.search(r"</?(p|h3|strong|em|br)\b", body, flags=re.I):
-        # maak minimale structuur met vereiste h3’s en de 4 regels
         safe = html.escape(body)
         body = (
             "<h3>Beschrijving</h3>\n"
@@ -559,7 +648,7 @@ def logout():
 @app.route('/api/collections', methods=['POST'])
 @require_login
 def api_collections():
-    global SHOPIFY_STORE_DOMAIN  # <-- belangrijk: vóór gebruik declareren
+    global SHOPIFY_STORE_DOMAIN  # belangrijk: vóór gebruik declareren
 
     payload = request.get_json(force=True)
     store = (payload.get('store') or SHOPIFY_STORE_DOMAIN).strip()
@@ -671,7 +760,7 @@ def api_optimize():
                             seo_desc=pieces['meta_description'],
                         )
 
-                        # 4b) Metafields bijwerken (alleen als ontbrekend)
+                        # 4b) Metafields bijwerken (alleen als ontbrekend) – gebruikt auto-detectie
                         try:
                             existing = shopify_product_metafields(token, store, pid)
                             parsed = parse_dimensions_from_text(pieces['title'] or title, pieces['body_html'] or body_html)
