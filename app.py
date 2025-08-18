@@ -100,9 +100,9 @@ def build_system_prompt(txn_mode: bool = False, txn_usps: Optional[List[str]] = 
 
         "TITELFORMAT – ALTIJD DIT PATROON GEBRUIKEN:\n"
         "  [Generieke naam] / [Latijnse naam] – ↕[hoogte in cm] – ⌀[pot diameter in cm]\n"
-        "  Als de plant in een sierpot zit: voeg toe: '– in [kleur] pot'.\n"
-        "  Voorbeeld zonder pot: Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27\n"
-        "  Voorbeeld met pot:   Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27 – in bruine pot\n"
+        "  Als de plant in een sierpot zit: voeg toe na pot diameter: '– in [kleur] pot'.\n"
+        "  Voorbeeld zonder pot: Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27cm\n"
+        "  Voorbeeld met pot:   Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27cm – in bruine pot\n"
         "Regels:\n"
         "  • Gebruik altijd de generieke NL-naam + Latijnse naam in die volgorde.\n"
         "  • Hoogte en potdiameter alleen invullen als je ze aantoonbaar kunt afleiden uit titel, variant of beschrijving. "
