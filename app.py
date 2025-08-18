@@ -5,6 +5,7 @@
 # Transactiefocus: koopwoorden in meta's + USP-lijst (default: Gratis verzending vanaf €49)
 # Annuleren: client AbortController + server-side cancel flags
 # Naamkoppelingen: vaste NL → Latijn lijst (UI + afdwingen in titel waar relevant)
+# Fixes: cm-units bij ↕/⌀, automatische "– in [kleur] pot" of generiek "– in pot" (zonder kleuren gokken)
 
 import os, json, time, textwrap, html, re
 from typing import List, Dict, Any, Optional, Tuple
@@ -46,7 +47,7 @@ META_DEBUG_MAPPING     = os.environ.get('META_DEBUG_MAPPING', '1') not in ('0', 
 META_MIRROR_MAX_HEIGHT = int(os.environ.get('META_MIRROR_MAX_HEIGHT', '2'))  # schrijf naar max 2 hoogtevelden
 META_MIRROR_MAX_DIAM   = int(os.environ.get('META_MIRROR_MAX_DIAM', '1'))    # schrijf naar max 1 diameterveld
 
-# Transactiefocus (koopwoorden in meta's) – standaard UIT, USP's inclusief €49-drempel
+# Transactiefocus (koopwoorden in meta's)
 TRANSACTIONAL_MODE = os.environ.get('TRANSACTIONAL_MODE', '0') not in ('0', 'false', 'False')
 TRANSACTIONAL_CLAIMS = [s.strip() for s in os.environ.get(
     'TRANSACTIONAL_CLAIMS',
@@ -56,7 +57,6 @@ TRANSACTIONAL_CLAIMS = [s.strip() for s in os.environ.get(
 # Vaste NL → Latijn naamkoppelingen (default; UI toont als regels)
 NAME_MAP_DEFAULT = os.environ.get(
     'NAME_MAP_DEFAULT',
-    # één regel per koppel; '|' is scheidingsteken
     'paradijsvogelplant=Strelitzia|flamingoplant=Anthurium|slaapplant=Calathea|gatenplant=Monstera|'
     'olifantsoor=Alocasia|hartbladige klimmer=Philodendron|hartjesplant=Philodendron scandens|'
     'klimphilodendron=Philodendron scandens|vrouwentong=Sansevieria|sanseveria=Sansevieria|'
@@ -139,10 +139,10 @@ def build_system_prompt(txn_mode: bool = False,
         "TITELFORMAT – BIJ VOORKEUR:\n"
         "  Gebruik waar zinvol het patroon: [Generieke NL-naam] / [Latijnse naam] – ↕[hoogte in cm] – ⌀[potdiameter in cm].\n"
         "  Als de Latijnse naam niet relevant of niet zeker is, mag je ook alleen de duidelijkste productnaam gebruiken (NL of Latijn).\n"
-        "  Als de plant in een sierpot zit: voeg optioneel toe: '– in [kleur] pot'.\n"
+        "  Als de plant in een sierpot zit en dat blijkt uit de productdata: voeg toe: '– in [kleur] pot'.\n"
         "Voorbeelden:\n"
-        "  • Gatenplant / Monstera – ↕150cm – ⌀27\n"
-        "  • Strelitzia – ↕120cm – ⌀24  (alleen Latijn waar dat gangbaar is)\n\n"
+        "  • Gatenplant / Monstera – ↕150cm – ⌀27cm – in bruine pot\n"
+        "  • Strelitzia – ↕120cm – ⌀24cm\n\n"
 
         "BESCHRIJVING – HTML-LAYOUT (vast stramien):\n"
         "  • Gebruik exact deze secties met <h3>-kopjes en 4 regels zonder bullets:\n"
@@ -218,7 +218,7 @@ def openai_chat_with_backoff(system_prompt: str, user_prompt: str, model: str = 
         except urllib.error.HTTPError as e:
             code = getattr(e, 'code', None)
             if code == 429 and attempt < OPENAI_MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)  # backoff: 1, 2, 4, ...
+                time.sleep(2 ** attempt)
                 continue
             try:
                 detail = e.read().decode('utf-8', 'ignore')
@@ -322,27 +322,146 @@ def shopify_graphql_update_product(store_domain: str, access_token: str, product
     return data["data"]["productUpdate"]["product"]
 
 
-# ---------- Metafields helpers (auto-detect + correct type + fallback + mirroring) ----------
+# ---------- Afmetingen + potkleur/pot-aanwezigheid parsing ----------
 
-DIM_HEIGHT_RE = re.compile(r"(?:↕\s*)?(\d{1,3})\s*cm", re.I)
-DIM_POT_RE    = re.compile(r"(?:[⌀ØO]\s*)?(\d{1,3})\s*(?:cm)?\b", re.I)
+RE_CM_RANGE       = re.compile(r"\b(\d{1,3})\s*[-–]\s*(\d{1,3})\s*cm\b", re.I)
+RE_HEIGHT_LABEL   = re.compile(r"(?:↕|hoogte)\s*[:=]?\s*(\d{1,3})\s*cm\b", re.I)
+RE_DIAM_LABEL     = re.compile(
+    r"(?:⌀|Ø|ø|diameter|doorsnede|pot\s*maat|potmaat|pot\s*diameter|potdiameter)\s*[:=]?\s*(\d{1,3})\s*cm?\b",
+    re.I
+)
+RE_DIAM_SYMBOL    = re.compile(r"[⌀Øø]\s*(\d{1,3})\s*cm?\b", re.I)
+RE_CM_ALL         = re.compile(r"\b(\d{1,3})\s*cm\b", re.I)
 
-# Cache: per store mapping + kandidaten
-_META_MAP_CACHE: Dict[str, Dict[str, Any]] = {}
+# Kleur bij "pot"
+COLOR_RE = r"(?:wit|witte|zwart|zwarte|grijs|grijze|lichtgrijs|lichtgrijze|donkergrijs|donkergrijze|antraciet|antracietgrijs|antracietgrijze|beige|taupe|terra(?:cotta)?|terracotta|bruin|bruine|groen|groene|lichtgroen|lichtgroene|donkergroen|donkergroene|blauw|blauwe|rood|rode|roze|paars|paarse|geel|gele|oranje|cr[eè]me|cr[eè]mekleur|goud|gouden|zilver|zilveren|koper|koperen|brons|bronzen)"
+RE_IN_COLOR_POT   = re.compile(r"\bin\s+(?P<color>"+COLOR_RE+r")\s+pot\b", re.I)
+RE_COLOR_POT      = re.compile(r"\b(?P<color>"+COLOR_RE+r")\s+pot\b", re.I)
+RE_POT_COLOR      = re.compile(r"\bpot(?:\s*[:\-]?\s*)(?P<color>"+COLOR_RE+r")\b", re.I)
+
+# Pot-aanwezigheid (zonder kleur)
+POT_PRESENCE_PATTERNS = [
+    re.compile(r"\bin\s+(?:een\s+)?pot\b", re.I),
+    re.compile(r"\bmet\s+(?:een\s+)?(?:sier)?pot\b", re.I),
+    re.compile(r"\bsierpot\b", re.I),
+    re.compile(r"\bdecor(?:atieve)?\s*pot\b", re.I),
+    re.compile(r"\bcoverpot\b", re.I),
+    re.compile(r"\bcachepot\b", re.I),
+    re.compile(r"\bplanter\b", re.I),
+]
+
+def _html_to_text(html_str: str) -> str:
+    return re.sub(r"<[^>]+>", " ", html_str or "", flags=re.I)
 
 def parse_dimensions_from_text(title: str, body_html: str) -> Dict[str, str]:
-    """Haal hoogte & potdiameter uit titel/body (strings, bv. '150')."""
-    text_body = re.sub(r"<[^>]+>", " ", body_html or "", flags=re.I)
+    """
+    Haal hoogte & potdiameter uit titel/body.
+    1) Labels/symbolen hebben voorrang; 2) '30–40cm' → gemiddelde hoogte;
+    3) Fallback: max(cm-getallen)=hoogte, min=diameter; 4) geen diameter==hoogte bij meerdere waarden.
+    """
+    text_body = _html_to_text(body_html)
     text = f"{title or ''}\n{text_body}"
 
-    h = re.search(r"↕\s*(\d{1,3})\s*cm", text) or DIM_HEIGHT_RE.search(text)
-    d = re.search(r"[⌀Ø]\s*(\d{1,3})\s*cm?", text) or DIM_POT_RE.search(text)
+    height: Optional[str] = None
+    pot: Optional[str] = None
+
+    m = RE_HEIGHT_LABEL.search(text)
+    if m:
+        height = m.group(1)
+    else:
+        mr = RE_CM_RANGE.search(text)
+        if mr:
+            a, b = int(mr.group(1)), int(mr.group(2))
+            height = str(round((a + b) / 2))
+
+    m = RE_DIAM_LABEL.search(text) or RE_DIAM_SYMBOL.search(text)
+    if m:
+        pot = m.group(1)
+
+    nums = [int(n) for n in RE_CM_ALL.findall(text)]
+    if len(nums) >= 2:
+        hi, lo = max(nums), min(nums)
+        if not height:
+            height = str(hi)
+        if not pot:
+            pot = str(lo)
+
+    if pot and height and pot == height and len(set(nums)) >= 2:
+        uniq = sorted(set(nums))
+        for v in uniq:
+            if str(v) != str(height):
+                pot = str(v)
+                break
 
     out: Dict[str, str] = {}
-    if h: out["height_cm"] = h.group(1)
-    if d: out["pot_diameter_cm"] = d.group(1)
+    if height:
+        out["height_cm"] = str(int(height))
+    if pot:
+        out["pot_diameter_cm"] = str(int(pot))
     return out
 
+def extract_pot_color(title: str, body_html: str) -> Optional[str]:
+    """Zoek een kleur direct bij 'pot/sierpot'. Retourneer originele kleurstring (met buiging)."""
+    text = f"{title or ''}\n{_html_to_text(body_html)}"
+    for rx in (RE_IN_COLOR_POT, RE_COLOR_POT, RE_POT_COLOR):
+        m = rx.search(text)
+        if m:
+            return m.group("color").strip()
+    return None
+
+def detect_pot_presence(title: str, body_html: str) -> bool:
+    """True als er duidelijke potvermelding is, ook zonder kleur (gokt nooit kleur)."""
+    text = f"{title or ''}\n{_html_to_text(body_html)}"
+    # reeds kleur-detectie geldt ook als pot-aanwezigheid
+    if extract_pot_color(title, body_html):
+        return True
+    for rx in POT_PRESENCE_PATTERNS:
+        if rx.search(text):
+            return True
+    return False
+
+def normalize_title_units_and_pot(title: str,
+                                  dims: Dict[str, str],
+                                  pot_color: Optional[str],
+                                  pot_present: bool) -> str:
+    """
+    Zorg dat ↕/⌀ blokken altijd 'cm' tonen; voeg ontbrekende blokken toe; voeg
+    '– in [kleur] pot' toe bij kleur, of generiek '– in pot' als pot aanwezig is
+    maar geen kleur gevonden werd (zonder te raden).
+    """
+    t = title or ""
+
+    # cm toevoegen als het ontbreekt
+    t = re.sub(r"(↕\s*\d{1,3})(?!\s*cm)\b", r"\1cm", t)
+    t = re.sub(r"([⌀Øø]\s*\d{1,3})(?!\s*cm)\b", r"\1cm", t)
+
+    # blokken toevoegen vanuit parser
+    h = dims.get("height_cm")
+    d = dims.get("pot_diameter_cm")
+
+    if h and not re.search(r"↕\s*\d{1,3}\s*cm", t):
+        if re.search(r"[⌀Øø]\s*\d{1,3}\s*cm", t):
+            t = re.sub(r"([⌀Øø]\s*\d{1,3}\s*cm)", f"↕{int(h)}cm – \\1", t, count=1)
+        else:
+            t = t.strip() + f" – ↕{int(h)}cm"
+
+    if d and not re.search(r"[⌀Øø]\s*\d{1,3}\s*cm", t):
+        t = t.strip() + f" – ⌀{int(d)}cm"
+
+    # pot-suffix (kleur > generiek)
+    has_any_pot_suffix = re.search(r"\bin\s+[^\n]*\bpot\b", t, re.I) is not None
+    if pot_color:
+        if not has_any_pot_suffix:
+            t = t.strip() + f" – in {pot_color} pot"
+    elif pot_present:
+        if not has_any_pot_suffix:
+            t = t.strip() + " – in pot"
+
+    return t
+
+# ---------- Metafields helpers (auto-detect + correct type + fallback + mirroring) ----------
+
+_META_MAP_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def _fetch_product_metafield_definitions(token: str, store_domain: str) -> List[Dict[str, Any]]:
     url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
@@ -365,7 +484,6 @@ def _fetch_product_metafield_definitions(token: str, store_domain: str) -> List[
 
 
 def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[str, Any]]:
-    """Geef gescoorde lijst kandidaten; prefer 'Hoogte (cm)' & 'Hoogte' (en diameter-varianten)."""
     hints = [h.strip().lower() for h in hints if h.strip()]
     out = []
     for d in defs:
@@ -378,13 +496,11 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
 
         tname = (((d.get("type") or {}).get("name")) or "single_line_text_field").lower()
         score = 0
-        # type voorkeur
         if "number_integer" in tname: score += 30
         elif "dimension" in tname:    score += 22
         elif "number_decimal" in tname: score += 18
         elif "single_line_text_field" in tname: score += 10
 
-        # exacte voorkeuren
         nname = re.sub(r"\s+", " ", name).strip().lower()
         if low_key == "hoogte_cm" or nname in ("hoogte (cm)", "height (cm)"):
             score += 60
@@ -395,8 +511,7 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
         elif low_key == "diameter" or nname == "diameter":
             score += 50
 
-        # semantische tweaks
-        if low_key.endswith("_"): score -= 8  # vaak category-gebonden of legacy
+        if low_key.endswith("_"): score -= 8
         if "cm" in low_key or "cm" in low_name: score += 4
         if low_key in ("hoogte_cm", "diameter_cm", "pot_diameter_cm", "hoogte", "diameter"): score += 6
         if ns.lower() == "custom": score += 2
@@ -413,7 +528,6 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
 
 
 def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
-    """Bepaal (en cache) kandidatenlijsten + topkeuzes."""
     cache_key = store_domain
     if cache_key in _META_MAP_CACHE:
         return _META_MAP_CACHE[cache_key]
@@ -422,7 +536,6 @@ def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
     height_cands = _rank_candidates(defs, META_HEIGHT_KEYS_HINT or ["hoogte","height"])
     diam_cands   = _rank_candidates(defs, META_DIAM_KEYS_HINT or ["diameter","pot","ø","⌀"])
 
-    # Fallbacks als er niets gevonden wordt
     if not height_cands:
         height_cands = [{"namespace": META_NAMESPACE_DEFAULT, "key": "height_cm",
                          "name": "height_cm", "type": "single_line_text_field", "score": 0}]
@@ -441,8 +554,7 @@ def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
 
 
 def shopify_product_metafields(token: str, store_domain: str, product_id_int: int) -> Dict[str, Any]:
-    """Lees huidige waarden volgens de beste gok (top-kandidaat)."""
-    mm = _ensure_meta_map(token, store_domain)
+    mm = _ensure_meta_map(token, store)
     gid = f"gid://shopify/Product/{int(product_id_int)}"
     url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
     query = """
@@ -459,7 +571,6 @@ def shopify_product_metafields(token: str, store_domain: str, product_id_int: in
 
 
 def _encode_value_for_type(val_str: str, tname: str) -> str:
-    """Converteer '45' naar juiste value-string per type."""
     t = (tname or "").lower()
     try:
         if t == "number_integer":
@@ -474,7 +585,6 @@ def _encode_value_for_type(val_str: str, tname: str) -> str:
 
 
 def _try_set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname: str, value_str: str) -> Tuple[bool, str]:
-    """Probeer één metafield te zetten; retourneer (ok, foutmelding)."""
     url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
     mutation = """
     mutation setOne($metafields: [MetafieldsSetInput!]!) {
@@ -504,10 +614,6 @@ def _try_set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tna
 
 def shopify_set_product_metafields(token: str, store_domain: str, product_id_int: int,
                                    values: Dict[str, str]) -> Dict[str, List[str]]:
-    """
-    Schrijf metafields met fallback over meerdere kandidaten (mirroring).
-    Retourneert {"height": ["ns.key [type]", ...], "diam": ["ns.key [type]", ...]}
-    """
     if not values:
         return {"height": [], "diam": []}
 
@@ -515,7 +621,6 @@ def shopify_set_product_metafields(token: str, store_domain: str, product_id_int
     gid = f"gid://shopify/Product/{int(product_id_int)}"
     written = {"height": [], "diam": []}
 
-    # Hoogte: spiegel naar max 2 kandidaten (bijv. 'hoogte_cm' + 'hoogte')
     if values.get("height_cm"):
         left = META_MIRROR_MAX_HEIGHT
         for d in mm["height_candidates"]:
@@ -530,7 +635,6 @@ def shopify_set_product_metafields(token: str, store_domain: str, product_id_int
                     continue
                 raise RuntimeError(f"metafieldsSet userErrors (height): {msg}")
 
-    # Diameter: spiegel naar max 1 kandidaat
     if values.get("pot_diameter_cm"):
         left = META_MIRROR_MAX_DIAM
         for d in mm["diam_candidates"]:
@@ -547,86 +651,9 @@ def shopify_set_product_metafields(token: str, store_domain: str, product_id_int
 
     return written
 
-# ---------- Einde Metafields helpers ----------
-
-
-def split_ai_output(text: str) -> Dict[str, str]:
-    """Parseer AI-output in titel, body_html, meta_title, meta_description."""
-    lines = [l.strip() for l in text.splitlines()]
-    blob = "\n".join(lines)
-
-    def find_marker(name_variants: List[str]) -> str:
-        for m in name_variants:
-            if m.lower() in blob.lower():
-                return m
-        return ""
-
-    markers = {
-        'title': find_marker(['Nieuwe titel:', 'Titel:', 'SEO titel:', 'Nieuwe SEO-titel:']),
-        'body': find_marker(['Beschrijving:', 'Body:', 'Productbeschrijving:', 'Gestandaardiseerde beschrijving:']),
-        'meta_title': find_marker(['Meta title:', 'SEO-meta title:', 'Title tag:']),
-        'meta_desc': find_marker(['Meta description:', 'SEO-meta description:', 'Description tag:']),
-    }
-
-    def extract(start_marker: str, end_markers: List[str]) -> str:
-        if not start_marker:
-            return ""
-        start = blob.lower().find(start_marker.lower())
-        if start == -1:
-            return ""
-        start += len(start_marker)
-        end_positions = []
-        for m in end_markers:
-            if not m:
-                continue
-            p = blob.lower().find(m.lower(), start)
-            if p != -1:
-                end_positions.append(p)
-        end = min(end_positions) if end_positions else len(blob)
-        return blob[start:end].strip().strip('-:').strip()
-
-    title = extract(markers['title'], [markers['body'], markers['meta_title'], markers['meta_desc']])
-    body = extract(markers['body'], [markers['meta_title'], markers['meta_desc']])
-    meta_title = extract(markers['meta_title'], [markers['meta_desc']])
-    meta_desc = extract(markers['meta_desc'], [])
-
-    if not title and not body and not meta_title and not meta_desc:
-        parts = [p.strip() for p in re.split(r"\n\s*\n", blob) if p.strip()]
-        title = parts[0] if len(parts) > 0 else ''
-        body = parts[1] if len(parts) > 1 else ''
-        meta_title = parts[2] if len(parts) > 2 else title[:60]
-        meta_desc = parts[3] if len(parts) > 3 else (body[:155] if body else title[:155])
-
-    meta_title = (meta_title or title)[:60]
-    meta_desc = (meta_desc or meta_title)[:155]
-
-    # Body naar eenvoudige HTML als er geen tags in staan
-    if body and not re.search(r"</?(p|h3|strong|em|br)\b", body, flags=re.I):
-        safe = html.escape(body)
-        body = (
-            "<h3>Beschrijving</h3>\n"
-            f"<p>{safe}</p>\n"
-            "<h3>Eigenschappen & behoeften</h3>\n"
-            "<p>☀ Lichtbehoefte: Onbekend</p>\n"
-            "<p>∿ Waterbehoefte: Onbekend</p>\n"
-            "<p>⌂ Standplaats: Onbekend</p>\n"
-            "<p>☠ Giftigheid: Onbekend</p>"
-        )
-
-    return {
-        'title': title,
-        'body_html': body,
-        'meta_title': meta_title,
-        'meta_description': meta_desc,
-    }
-
 # ---------- Naamkoppelingen helpers ----------
 
 def parse_name_map_text(txt: str) -> Dict[str, str]:
-    """
-    Parseer 'nl=Latijn' paren uit tekst (gescheiden door nieuwe regels of |).
-    Regels die met # beginnen worden genegeerd. Keys zijn case-insensitive.
-    """
     if not txt:
         return {}
     pairs = re.split(r"[|\n]+", txt)
@@ -646,22 +673,14 @@ def parse_name_map_text(txt: str) -> Dict[str, str]:
 
 
 def enforce_title_name_map(title: str, name_map: Dict[str, str]) -> str:
-    """
-    Als titel het patroon 'NL / Latijn – …' volgt en de NL-naam matcht een key,
-    vervang dan de Latijnse naam door de opgegeven waarde.
-    """
     if not title or not name_map:
         return title
-
-    # match: [NL] / [Latijn] – rest
     m = re.match(r"^\s*([^/\n]+?)\s*/\s*([^–—\-]+?)\s*(?:–|—|-)\s*(.*)$", title)
     if not m:
         return title
-
     nl = m.group(1).strip()
     lat = m.group(2).strip()
     rest = m.group(3)
-
     nl_low = nl.lower()
     for k, v in name_map.items():
         if k in nl_low:
@@ -671,7 +690,7 @@ def enforce_title_name_map(title: str, name_map: Dict[str, str]) -> str:
     return title
 
 # -------------------------------
-# UI (HTML)  (placeholders [[STORE]], [[MODEL]], [[BATCH]], [[DELAY]], [[TXNUSPS]], [[TXNCHECKED]], [[NAMEMAP]])
+# UI (HTML)
 # -------------------------------
 
 LOGIN_HTML = '''<!doctype html><html lang="nl"><head>
@@ -915,13 +934,13 @@ def logout():
 @app.route('/api/collections', methods=['POST'])
 @require_login
 def api_collections():
-    global SHOPIFY_STORE_DOMAIN  # belangrijk: vóór gebruik declareren
+    global SHOPIFY_STORE_DOMAIN
 
     payload = request.get_json(force=True)
     store = (payload.get('store') or SHOPIFY_STORE_DOMAIN).strip()
     token = (payload.get('token') or '').strip()
 
-    SHOPIFY_STORE_DOMAIN = store  # update de globale store voor volgende calls
+    SHOPIFY_STORE_DOMAIN = store
 
     if not token:
         return jsonify({'error': 'Geen Shopify token meegegeven.'}), 400
@@ -954,10 +973,7 @@ def api_optimize():
     collection_ids = payload.get('collection_ids') or []
 
     # Transactiefocus-opties
-    if 'txn' in payload:
-        txn_mode = bool(payload.get('txn'))
-    else:
-        txn_mode = TRANSACTIONAL_MODE
+    txn_mode = bool(payload.get('txn')) if 'txn' in payload else TRANSACTIONAL_MODE
     txn_usps_input = payload.get('txn_usps') or ""
     txn_usps = [s.strip() for s in txn_usps_input.split('|') if s.strip()] or TRANSACTIONAL_CLAIMS
 
@@ -981,7 +997,6 @@ def api_optimize():
     def generate():
         try:
             yield f"Job: {job_id}\n"
-            # 0) Toon (top) mapping – en de eerste 2 hoogte-kandidaten
             mm_dbg = _ensure_meta_map(token, store)
             if META_DEBUG_MAPPING:
                 def _fmt(d): return f"{d['namespace']}.{d['key']} [{d['type']}]"
@@ -1030,7 +1045,7 @@ def api_optimize():
                     pid = int(p['id'])
                     title = p.get('title', '') or ''
                     body_html = p.get('body_html', '') or ''
-                    tags = p.get('tags', '') or ''
+                    tags = p.get('tags', '') or ''  # (niet gebruikt voor parsing)
 
                     base_prompt = textwrap.dedent(f"""
                         Originele titel: {title}
@@ -1071,8 +1086,14 @@ def api_optimize():
                         out = openai_chat_with_backoff(sys_prompt, final_prompt, model=model, temperature=DEFAULT_TEMPERATURE)
                         pieces = split_ai_output(out)
 
-                        # Titel: afdwingen NL→Latijn mapping waar relevant
-                        pieces['title'] = enforce_title_name_map(pieces['title'] or title, name_map)
+                        # Parse uit AI-output/titel/body
+                        dims = parse_dimensions_from_text(pieces['title'] or title, pieces['body_html'] or body_html)
+                        pot_color = extract_pot_color(pieces['title'] or title, pieces['body_html'] or body_html)
+                        pot_present = detect_pot_presence(pieces['title'] or title, pieces['body_html'] or body_html)
+
+                        # Titel: naamkoppelingen afdwingen + cm-units/pot-suffix normaliseren
+                        tmp_title = enforce_title_name_map(pieces['title'] or title, name_map)
+                        pieces['title'] = normalize_title_units_and_pot(tmp_title, dims, pot_color, pot_present)
 
                         # 4a) Shopify: titel/HTML/SEO updaten
                         _ = shopify_graphql_update_product(
@@ -1087,12 +1108,11 @@ def api_optimize():
 
                         # 4b) Metafields bijwerken – ALTIJD schrijven als we een waarde konden parsen
                         try:
-                            parsed = parse_dimensions_from_text(pieces['title'] or title, pieces['body_html'] or body_html)
                             to_write: Dict[str, str] = {}
-                            if parsed.get("height_cm"):
-                                to_write["height_cm"] = parsed["height_cm"]
-                            if parsed.get("pot_diameter_cm"):
-                                to_write["pot_diameter_cm"] = parsed["pot_diameter_cm"]
+                            if dims.get("height_cm"):
+                                to_write["height_cm"] = dims["height_cm"]
+                            if dims.get("pot_diameter_cm"):
+                                to_write["pot_diameter_cm"] = dims["pot_diameter_cm"]
 
                             if to_write:
                                 written = shopify_set_product_metafields(token, store, pid, to_write)
@@ -1128,10 +1148,7 @@ def api_optimize():
     return Response(
         generate(),
         mimetype='text/plain',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no'
-        }
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
     )
 
 
