@@ -1,16 +1,8 @@
 # app.py
 # Belle Flora SEO Optimizer – compact & efficiënt
-# Features:
-# • Inloggen (env: ADMIN_USERNAME/ADMIN_PASSWORD)
-# • Dashboard met transactiefocus, vaste NL→Latijn koppelingen, annuleren-knop
-# • Streaming batch-verwerking met server-side cancel
-# • OpenAI (server-side key) met backoff
-# • Shopify REST + GraphQL met backoff (requests.Session)
-# • Auto-detect & mirroring van product-metafields (hoogte/diameter) met typecorrectie
-# • Parser: ↕/⌀ altijd met "cm", range-hoogte gemid., diameter nooit gelijk aan hoogte
-# • Potkleur (– in [kleur] pot) of generiek (– in pot) zonder te raden
-# • Naamkoppelingen afdwingen in titel
-# • Geen data uit variant-titels of tags voor afmetingen (bewust)
+# Belangrijkste wijzigingen in deze versie:
+# • Meta title post-processor die | Belle Flora nooit afknipt en desnoods de titel slim inkort.
+# • split_ai_output kapt de meta title niet meer hard af; limits gebeuren pas in finalize stap.
 
 import os, re, json, time, html, textwrap
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,6 +32,12 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 DELAY_PER_PRODUCT = float(os.environ.get("DELAY_SECONDS", "2.5"))
 SHOPIFY_RETRIES = int(os.environ.get("SHOPIFY_MAX_RETRIES", "4"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "60"))
+
+# Merknaam / meta-suffix
+BRAND_NAME = os.environ.get("BRAND_NAME", "Belle Flora").strip()
+META_SUFFIX = f" | {BRAND_NAME}"
+META_TITLE_LIMIT = int(os.environ.get("META_TITLE_LIMIT", "60"))
+META_DESC_LIMIT = int(os.environ.get("META_DESC_LIMIT", "155"))
 
 # Metafields autodetect/mirroring
 META_NAMESPACE_DEFAULT = os.environ.get("META_NAMESPACE_DEFAULT", "specs")
@@ -178,15 +176,13 @@ def _openai_chat(system_prompt: str, user_prompt: str, model: str = OPENAI_MODEL
             r.raise_for_status()
             payload = r.json()
             return payload["choices"][0]["message"]["content"]
-        except requests.HTTPError as e:
+        except requests.HTTPError:
             if r is not None and r.status_code == 429 and i < OPENAI_RETRIES - 1:
-                time.sleep(2 ** i)
-                continue
-            raise RuntimeError(f"OpenAI HTTP {getattr(r,'status_code', '?')}: {getattr(r,'text','')}")
+                time.sleep(2 ** i); continue
+            raise RuntimeError(f"OpenAI HTTP {getattr(r,'status_code','?')}: {getattr(r,'text','')}")
         except Exception as ex:
             if i < OPENAI_RETRIES - 1:
-                time.sleep(2 ** i)
-                continue
+                time.sleep(2 ** i); continue
             raise RuntimeError(f"OpenAI call failed: {ex}")
 
 # =========================
@@ -201,10 +197,9 @@ def _build_system_prompt(txn: bool, usps: List[str], name_map: Dict[str, str]) -
         txn_block = (
             "TRANSACTIONELE META-RICHTLIJNEN:\n"
             "  • Gebruik waar natuurlijk koopgerichte woorden (Koop/Bestel/Shop/Online/Nu).\n"
-            "  • Meta title ≤60: start bij voorkeur met koopwoord + product, eindig met '| Belle Flora' als er ruimte is.\n"
-            f"  • Meta description ≤155: voeg 1–2 USP's toe en een subtiele CTA. USP-lijst: {usps_str}\n\n"
+            f"  • Meta title ≤{META_TITLE_LIMIT}: start met koopwoord + product, eindig met '| {BRAND_NAME}' als er ruimte is.\n"
+            f"  • Meta description ≤{META_DESC_LIMIT}: voeg 1–2 USP's toe en een subtiele CTA. USP-lijst: {usps_str}\n\n"
         )
-
     return (
         "Je bent een ervaren NL SEO-copywriter voor planten (Belle Flora). Schrijf natuurlijk, feitelijk, klantgericht.\n\n"
         "TITEL:\n"
@@ -220,7 +215,7 @@ def _build_system_prompt(txn: bool, usps: List[str], name_map: Dict[str, str]) -
         "  <p>☠ Giftigheid: …</p>\n"
         "  • Alleen eenvoudige HTML: <h3>, <p>, <strong>, <em>.\n\n"
         "SEO:\n"
-        "  • Lever Meta title (≤60) en Meta description (≤155). Iedere tekst uniek.\n\n"
+        "  • Lever Meta title en Meta description binnen de lengte-limieten. Iedere tekst uniek.\n\n"
         f"NAAMCONSISTENTIE (toepassen wanneer relevant):\n{nm_lines}\n\n"
         f"{txn_block}"
         "OUTPUT (exacte labels):\n"
@@ -234,11 +229,9 @@ def _build_system_prompt(txn: bool, usps: List[str], name_map: Dict[str, str]) -
 # Parsing & titel-normalisatie
 # =========================
 
-# Regexes (precompiled)
 RE_CM_RANGE       = re.compile(r"\b(\d{1,3})\s*[-–]\s*(\d{1,3})\s*cm\b", re.I)
 RE_HEIGHT_LABEL   = re.compile(r"(?:↕|hoogte)\s*[:=]?\s*(\d{1,3})\s*cm\b", re.I)
-RE_DIAM_LABEL     = re.compile(
-    r"(?:⌀|Ø|ø|diameter|doorsnede|pot\s*maat|potmaat|pot\s*diameter|potdiameter)\s*[:=]?\s*(\d{1,3})\s*cm?\b", re.I)
+RE_DIAM_LABEL     = re.compile(r"(?:⌀|Ø|ø|diameter|doorsnede|pot\s*maat|potmaat|pot\s*diameter|potdiameter)\s*[:=]?\s*(\d{1,3})\s*cm?\b", re.I)
 RE_DIAM_SYMBOL    = re.compile(r"[⌀Øø]\s*(\d{1,3})\s*cm?\b", re.I)
 RE_CM_ALL         = re.compile(r"\b(\d{1,3})\s*cm\b", re.I)
 
@@ -261,11 +254,9 @@ def _html_to_text(s: str) -> str:
     return re.sub(r"<[^>]+>", " ", s or "", flags=re.I)
 
 def parse_dimensions(title: str, body_html: str) -> Dict[str, str]:
-    """Alleen uit titel/body (geen varianten/tags). Range → gemiddelde; diameter ≠ hoogte."""
     text = f"{title or ''}\n{_html_to_text(body_html)}"
     height = None
     diam = None
-
     m = RE_HEIGHT_LABEL.search(text)
     if m:
         height = int(m.group(1))
@@ -274,90 +265,67 @@ def parse_dimensions(title: str, body_html: str) -> Dict[str, str]:
         if mr:
             a, b = int(mr.group(1)), int(mr.group(2))
             height = round((a + b) / 2)
-
     md = RE_DIAM_LABEL.search(text) or RE_DIAM_SYMBOL.search(text)
     if md:
         diam = int(md.group(1))
-
     nums = [int(n) for n in RE_CM_ALL.findall(text)]
     if len(nums) >= 2:
         hi, lo = max(nums), min(nums)
-        if height is None:
-            height = hi
-        if diam is None:
-            diam = lo
-
+        if height is None: height = hi
+        if diam is None: diam = lo
     if diam is not None and height is not None and diam == height and len(set(nums)) >= 2:
         for v in sorted(set(nums)):
             if v != height:
-                diam = v
-                break
-
+                diam = v; break
     out: Dict[str, str] = {}
-    if height is not None:
-        out["height_cm"] = str(height)
-    if diam is not None:
-        out["pot_diameter_cm"] = str(diam)
+    if height is not None: out["height_cm"] = str(height)
+    if diam is not None: out["pot_diameter_cm"] = str(diam)
     return out
 
 def extract_pot_color(title: str, body_html: str) -> Optional[str]:
     text = f"{title or ''}\n{_html_to_text(body_html)}"
     for rx in (RE_IN_COLOR_POT, RE_COLOR_POT, RE_POT_COLOR):
         m = rx.search(text)
-        if m:
-            return m.group("color").strip()
+        if m: return m.group("color").strip()
     return None
 
 def detect_pot_presence(title: str, body_html: str) -> bool:
-    if extract_pot_color(title, body_html):
-        return True
+    if extract_pot_color(title, body_html): return True
     text = f"{title or ''}\n{_html_to_text(body_html)}"
     return any(rx.search(text) for rx in POT_PRESENCE)
 
 def normalize_title(title: str, dims: Dict[str, str], pot_color: Optional[str], pot_present: bool) -> str:
-    """↕/⌀ altijd met cm; misende blokken toevoegen; '– in [kleur] pot' of generiek '– in pot'."""
     t = title or ""
     t = re.sub(r"(↕\s*\d{1,3})(?!\s*cm)\b", r"\1cm", t)
     t = re.sub(r"([⌀Øø]\s*\d{1,3})(?!\s*cm)\b", r"\1cm", t)
-
-    h = dims.get("height_cm")
-    d = dims.get("pot_diameter_cm")
-
+    h = dims.get("height_cm"); d = dims.get("pot_diameter_cm")
     if h and not re.search(r"↕\s*\d{1,3}\s*cm", t):
         if re.search(r"[⌀Øø]\s*\d{1,3}\s*cm", t):
             t = re.sub(r"([⌀Øø]\s*\d{1,3}\s*cm)", f"↕{int(h)}cm – \\1", t, count=1)
         else:
             t = (t.strip() + f" – ↕{int(h)}cm").strip()
-
     if d and not re.search(r"[⌀Øø]\s*\d{1,3}\s*cm", t):
         t = (t.strip() + f" – ⌀{int(d)}cm").strip()
-
     has_pot_suffix = re.search(r"\bin\s+[^\n]*\bpot\b", t, re.I) is not None
     if pot_color and not has_pot_suffix:
         t += f" – in {pot_color} pot"
     elif pot_present and not has_pot_suffix:
         t += " – in pot"
-
     return t.strip()
 
 def parse_name_map_text(txt: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for raw in re.split(r"[|\n]+", txt or ""):
-        if not raw.strip() or raw.strip().startswith("#") or "=" not in raw:
-            continue
+        if not raw.strip() or raw.strip().startswith("#") or "=" not in raw: continue
         nl, la = raw.split("=", 1)
         out[nl.strip().lower()] = la.strip()
     return out
 
 def enforce_title_name_map(title: str, name_map: Dict[str, str]) -> str:
-    if not title or not name_map:
-        return title
+    if not title or not name_map: return title
     m = re.match(r"^\s*([^/\n]+?)\s*/\s*([^–—\-]+?)\s*(?:–|—|-)\s*(.*)$", title)
-    if not m:
-        return title
-    nl = m.group(1).strip()
-    lat = m.group(2).strip()
-    rest = m.group(3)
+    if not m: return title
+    nl = m.group(1).strip(); lat = m.group(2).strip(); rest = m.group(3)
     key = nl.lower()
     for k, v in name_map.items():
         if k in key and lat != v:
@@ -365,62 +333,83 @@ def enforce_title_name_map(title: str, name_map: Dict[str, str]) -> str:
     return title
 
 def split_ai_output(text: str) -> Dict[str, str]:
-    """Robuuste parser voor de 4 labels; fallback via paragrafen."""
     lines = [l.rstrip() for l in (text or "").splitlines()]
     blob = "\n".join(lines)
-
     def find(marks: List[str]) -> str:
         for m in marks:
-            if m and m.lower() in blob.lower():
-                return m
+            if m and m.lower() in blob.lower(): return m
         return ""
-
     marks = {
         "title": find(["Nieuwe titel:", "Titel:", "SEO titel:", "SEO-titel:"]),
         "body": find(["Beschrijving:", "Body:", "Productbeschrijving:", "Gestandaardiseerde beschrijving:"]),
         "meta_title": find(["Meta title:", "SEO-meta title:", "Title tag:"]),
         "meta_desc": find(["Meta description:", "SEO-meta description:", "Description tag:"]),
     }
-
     def extract(start: str, enders: List[str]) -> str:
-        if not start:
-            return ""
+        if not start: return ""
         s = blob.lower().find(start.lower())
-        if s == -1:
-            return ""
+        if s == -1: return ""
         s += len(start)
-        e_positions = [blob.lower().find(e.lower(), s) for e in enders if e]
-        e_positions = [p for p in e_positions if p != -1]
-        e = min(e_positions) if e_positions else len(blob)
+        ends = [blob.lower().find(e.lower(), s) for e in enders if e]
+        ends = [p for p in ends if p != -1]
+        e = min(ends) if ends else len(blob)
         return blob[s:e].strip().strip("-: ").strip()
-
     title = extract(marks["title"], [marks["body"], marks["meta_title"], marks["meta_desc"]])
     body = extract(marks["body"], [marks["meta_title"], marks["meta_desc"]])
     meta_title = extract(marks["meta_title"], [marks["meta_desc"]])
     meta_desc = extract(marks["meta_desc"], [])
-
     if not any([title, body, meta_title, meta_desc]):
         parts = [p.strip() for p in re.split(r"\n\s*\n", blob) if p.strip()]
         title = parts[0] if len(parts) > 0 else ""
         body = parts[1] if len(parts) > 1 else ""
-        meta_title = parts[2] if len(parts) > 2 else title[:60]
-        meta_desc = parts[3] if len(parts) > 3 else (body[:155] if body else title[:155])
-
-    meta_title = (meta_title or title)[:60]
-    meta_desc = (meta_desc or meta_title)[:155]
-
-    if body and not re.search(r"</?(p|h3|strong|em|br)\b", body, flags=re.I):
-        safe = html.escape(body)
-        body = (
-            "<h3>Beschrijving</h3>\n"
-            f"<p>{safe}</p>\n"
-            "<h3>Eigenschappen & behoeften</h3>\n"
-            "<p>☀ Lichtbehoefte: Onbekend</p>\n"
-            "<p>∿ Waterbehoefte: Onbekend</p>\n"
-            "<p>⌂ Standplaats: Onbekend</p>\n"
-            "<p>☠ Giftigheid: Onbekend</p>"
-        )
+        meta_title = parts[2] if len(parts) > 2 else title
+        meta_desc = parts[3] if len(parts) > 3 else (body or title)
+    # Geen harde slices hier; finale trimming gebeurt later
     return {"title": title, "body_html": body, "meta_title": meta_title, "meta_description": meta_desc}
+
+# ---------- Meta finalizers (NIEUW) ----------
+
+_BREAK_RE = re.compile(r"[ \u00A0\u2009\u200A\u200B\u202F\-–—·•,:;]")
+
+def _trim_to_limit(text: str, limit: int) -> str:
+    if len(text) <= limit: return text
+    cut = text[:limit]
+    # probeer laatste scheidingsteken/space
+    m = list(_BREAK_RE.finditer(cut))
+    if m:
+        cut = cut[:m[-1].start()]
+    return cut.rstrip(" -–—·|")
+
+def finalize_meta_title(raw: str, title_fallback: str, limit: int = META_TITLE_LIMIT,
+                        brand: str = BRAND_NAME, suffix: str = META_SUFFIX) -> str:
+    base = (raw or title_fallback or "").strip()
+    if not base: return (brand if len(brand) <= limit else brand[:limit])
+    # verwijder halve merksuffix (bv. " | Belle Flor")
+    partial = re.compile(rf"\s*\|\s*{re.escape(brand[:-1])}[a-zA-Z]?\s*$")
+    if not base.endswith(suffix):
+        base = partial.sub("", base)
+    # voeg/forceer volledige suffix
+    if base.endswith(suffix):
+        if len(base) <= limit: return base
+        prefix = base[:-len(suffix)].rstrip(" -–—|")
+        prefix = _trim_to_limit(prefix, max(0, limit - len(suffix)))
+        return (prefix + suffix)[:limit]
+    else:
+        if f" {brand}" in base or brand in base:
+            # bevat merk al ergens; dan alleen net inkorten
+            return _trim_to_limit(base, limit)
+        if len(base) + len(suffix) <= limit:
+            return base + suffix
+        prefix = _trim_to_limit(base, max(0, limit - len(suffix)))
+        if not prefix:  # hoekgeval
+            return _trim_to_limit(brand, limit)
+        return (prefix + suffix)[:limit]
+
+def finalize_meta_desc(raw: str, body_fallback: str, title_fallback: str,
+                       limit: int = META_DESC_LIMIT) -> str:
+    text = (raw or body_fallback or title_fallback or "").strip()
+    if len(text) <= limit: return text
+    return _trim_to_limit(text, limit)
 
 # =========================
 # Shopify GraphQL helpers (metafields)
@@ -444,12 +433,9 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
     out: List[Dict[str, Any]] = []
     hints = [h.lower().strip() for h in hints]
     for d in defs:
-        name = (d.get("name") or "")
-        key = (d.get("key") or "")
-        ns = (d.get("namespace") or "")
+        name = (d.get("name") or ""); key = (d.get("key") or ""); ns = (d.get("namespace") or "")
         lname, lkey = name.lower(), key.lower()
-        if not any(h in lname or h in lkey for h in hints):
-            continue
+        if not any(h in lname or h in lkey for h in hints): continue
         tname = (((d.get("type") or {}).get("name")) or "single_line_text_field").lower()
         score = 0
         if "number_integer" in tname: score += 30
@@ -465,8 +451,7 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
 
 def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
     cache_key = store_domain
-    if cache_key in _META_MAP_CACHE:
-        return _META_MAP_CACHE[cache_key]
+    if cache_key in _META_MAP_CACHE: return _META_MAP_CACHE[cache_key]
     defs = _defs_for_product(token, store_domain)
     h = _rank_candidates(defs, META_HEIGHT_KEYS_HINT or ["hoogte","height"])
     d = _rank_candidates(defs, META_DIAM_KEYS_HINT or ["diameter","pot","ø","⌀"])
@@ -475,8 +460,7 @@ def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
     if not d:
         d = [{"namespace": META_NAMESPACE_DEFAULT, "key": "pot_diameter_cm", "name": "pot_diameter_cm", "type": "single_line_text_field", "score": 0}]
     mm = {
-        "height_candidates": h,
-        "diam_candidates": d,
+        "height_candidates": h, "diam_candidates": d,
         "height_ns": h[0]["namespace"], "height_key": h[0]["key"], "height_type": h[0]["type"],
         "diam_ns": d[0]["namespace"], "diam_key": d[0]["key"], "diam_type": d[0]["type"],
     }
@@ -486,12 +470,9 @@ def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
 def _encode_value(val_str: str, tname: str) -> str:
     t = (tname or "").lower()
     try:
-        if t == "number_integer":
-            return str(int(val_str))
-        if t == "number_decimal":
-            return str(float(val_str))
-        if t == "dimension":
-            return json.dumps({"value": float(val_str), "unit": "cm"})
+        if t == "number_integer": return str(int(val_str))
+        if t == "number_decimal": return str(float(val_str))
+        if t == "dimension": return json.dumps({"value": float(val_str), "unit": "cm"})
     except Exception:
         pass
     return str(val_str)
@@ -509,14 +490,11 @@ def _set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname: 
     }]}}
     data = _post(_gql_url(store_domain), token, payload)
     ue = (data.get("data", {}).get("metafieldsSet", {}) or {}).get("userErrors", [])
-    if ue:
-        return False, (ue[0].get("message") or str(ue))
+    if ue: return False, (ue[0].get("message") or str(ue))
     return True, ""
 
 def set_product_metafields(token: str, store_domain: str, product_id: int, values: Dict[str, str]) -> Dict[str, List[str]]:
-    """Schrijf naar meerdere definities (mirroring) met typecorrectie; sla subtype-fouten stil over."""
-    if not values:
-        return {"height": [], "diam": []}
+    if not values: return {"height": [], "diam": []}
     mm = _ensure_meta_map(token, store_domain)
     gid = f"gid://shopify/Product/{int(product_id)}"
     written = {"height": [], "diam": []}
@@ -558,8 +536,7 @@ def update_product_texts(store_domain: str, token: str, product_id: int,
                            "seo": {"title": seo_title or new_title, "description": seo_desc or ""}}}
     data = _post(_gql_url(store_domain), token, {"query": mutation, "variables": variables})
     errs = (data.get("data", {}).get("productUpdate", {}) or {}).get("userErrors", [])
-    if errs:
-        raise RuntimeError(f"Shopify productUpdate: {errs}")
+    if errs: raise RuntimeError(f"Shopify productUpdate: {errs}")
 
 # =========================
 # Auth & UI
@@ -567,11 +544,9 @@ def update_product_texts(store_domain: str, token: str, product_id: int,
 
 def _require_login(fn):
     def wrapper(*args, **kwargs):
-        if not session.get("logged_in"):
-            return redirect("/login")
+        if not session.get("logged_in"): return redirect("/login")
         return fn(*args, **kwargs)
-    wrapper.__name__ = fn.__name__
-    return wrapper
+    wrapper.__name__ = fn.__name__; return wrapper
 
 LOGIN_HTML = """<!doctype html><html lang="nl"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -805,7 +780,7 @@ def api_optimize():
                 all_pids = [int(p["id"]) for p in prods]
 
             yield f"Collecties: {len(collection_ids) or 0} geselecteerd — {len(all_pids)} producten gevonden\n"
-            yield f"Instellingen: batch={BATCH_SIZE}, delay={DELAY_PER_PRODUCT:.1f}s, model={model} (server-side), transactie={"aan" if txn else "uit"}\n"
+            yield f"Instellingen: batch={BATCH_SIZE}, delay={DELAY_PER_PRODUCT:.1f}s, model={model} (server-side), transactie={'aan' if txn else 'uit'}\n"
 
             processed = 0
             for i in range(0, len(all_pids), BATCH_SIZE):
@@ -837,7 +812,7 @@ def api_optimize():
                            <p>∿ Waterbehoefte: …</p>
                            <p>⌂ Standplaats: …</p>
                            <p>☠ Giftigheid: …</p>
-                        3) Meta title (≤60) en Meta description (≤155).
+                        3) Meta title (≤{META_TITLE_LIMIT}) en Meta description (≤{META_DESC_LIMIT}).
 
                         Output EXACT in dit format:
                         Nieuwe titel: …
@@ -862,10 +837,14 @@ def api_optimize():
                         t1 = enforce_title_name_map(parts["title"] or title, name_map)
                         parts["title"] = normalize_title(t1, dims, pot_color, pot_present)
 
+                        # ---- NIEUW: meta finalization (bewaar | Belle Flora ongesneden) ----
+                        final_meta_title = finalize_meta_title(parts["meta_title"], parts["title"], META_TITLE_LIMIT, BRAND_NAME, META_SUFFIX)
+                        final_meta_desc  = finalize_meta_desc(parts["meta_description"], parts["body_html"], parts["title"], META_DESC_LIMIT)
+
                         update_product_texts(store, token, pid,
                                              parts["title"] or title,
                                              parts["body_html"] or body_html,
-                                             parts["meta_title"], parts["meta_description"])
+                                             final_meta_title, final_meta_desc)
 
                         to_write: Dict[str, str] = {}
                         if dims.get("height_cm"): to_write["height_cm"] = dims["height_cm"]
@@ -901,10 +880,6 @@ def api_optimize():
 @app.route("/healthz")
 def healthz():
     return "ok", 200
-
-# =========================
-# Main
-# =========================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
