@@ -1,6 +1,7 @@
 # app.py
 # Belle Flora SEO Optimizer – Flask (Render/Railway ready)
 # NL UI • Login via env vars • Server-side OpenAI key • Collectie-selectie • Batching • Backoff • GraphQL updates
+# Vaste h3-secties + zwart-wit symbolen: ☀ (Lichtbehoefte), ∿ (Waterbehoefte), ⌂ (Standplaats), ☠ (Giftigheid)
 
 import os, json, time, textwrap, html, re
 from typing import List, Dict, Any
@@ -25,7 +26,7 @@ DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-4o-mini')
 DEFAULT_TEMPERATURE = float(os.environ.get('DEFAULT_TEMPERATURE', '0.7'))
 
 # Batch/vertragingsinstellingen
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '8'))          # aantal producten per API-read batch
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '8'))                # aantal producten per API-read batch
 DELAY_PER_PRODUCT = float(os.environ.get('DELAY_SECONDS', '2.5'))  # pauze tussen producten
 OPENAI_MAX_RETRIES = int(os.environ.get('OPENAI_MAX_RETRIES', '4'))
 SHOPIFY_MAX_RETRIES = int(os.environ.get('SHOPIFY_MAX_RETRIES', '4'))
@@ -44,7 +45,7 @@ def require_login(fn):
 
 
 def build_system_prompt() -> str:
-    """Vaste system prompt – bevat titel-format + beschrijvings/SEO-regels."""
+    """Vaste system prompt – titel-format + vaste secties + zwart-wit symbolen (geen bullets)."""
     return (
         "Je bent een ervaren Nederlandstalige SEO-copywriter voor een plantenwebshop (Belle Flora). "
         "Schrijf klantgericht, natuurlijk en informatief. Optimaliseer subtiel voor SEO zonder keyword stuffing. "
@@ -53,25 +54,26 @@ def build_system_prompt() -> str:
         "TITELFORMAT – ALTIJD DIT PATROON GEBRUIKEN:\n"
         "  [Generieke naam] / [Latijnse naam] – ↕[hoogte in cm] – ⌀[pot diameter in cm]\n"
         "  Als de plant in een sierpot zit: voeg toe: '– in [kleur] pot'.\n"
-        "  Voorbeeld zonder pot: Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27cm\n"
-        "  Voorbeeld met pot:   Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27cm – in bruine pot\n"
+        "  Voorbeeld zonder pot: Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27\n"
+        "  Voorbeeld met pot:   Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27 – in bruine pot\n"
         "Regels:\n"
         "  • Gebruik altijd de generieke NL-naam + Latijnse naam in die volgorde.\n"
         "  • Hoogte en potdiameter alleen invullen als je ze aantoonbaar kunt afleiden uit titel, variant of beschrijving. "
-        "    Als een waarde onbekend is, laat dat deel dan weg in de titel (liever niets dan gokken).\n"
+        "    Als een waarde onbekend is, laat dat blok dan weg in de titel (liever niets dan gokken).\n"
         "  • Gebruik het ‘–’ (en dash) tussen blokken en de symbolen ↕ en ⌀.\n\n"
 
-        "BESCHRIJVING – HTML-LAYOUT:\n"
-        "  • Korte inleiding (2–3 zinnen) met voordelen en situering (kamer/tuinplant, levering aan huis).\n"
-        "  • Sectie ‘Eigenschappen & behoeften’ als bulletlist (<ul><li>…</li></ul>) met o.a.:\n"
-        "      – Lichtbehoefte (bv. halfschaduw, veel indirect licht)\n"
-        "      – Waterbehoefte (bv. 1× per week licht vochtig houden)\n"
-        "      – Standplaats (binnen/buiten, tocht vermijden, temp-range indien relevant)\n"
-        "      – Groei/hoogte (indicatief, alleen als bekend)\n"
-        "      – Giftigheid/dier-vriendelijk (indien relevant)\n"
-        "  • Eventueel een korte verzorgingstip in <p>…</p>.\n"
-        "  • Gebruik eenvoudige, schone HTML (<p>, <ul>, <li>, <strong>, <em>); geen inline-styles, geen H1. "
-        "    Houd het goed leesbaar én makkelijk te crawlen.\n\n"
+        "BESCHRIJVING – HTML-LAYOUT (vast stramien):\n"
+        "  • Gebruik altijd exact deze secties met <h3> kopjes:\n"
+        "      1) <h3>Beschrijving</h3> gevolgd door 1 korte paragraaf (<p>…) met 2–3 zinnen.\n"
+        "      2) <h3>Eigenschappen & behoeften</h3> gevolgd door 4 regels (géén bullets, géén <ul>):\n"
+        "         <p>☀ Lichtbehoefte: …</p>\n"
+        "         <p>∿ Waterbehoefte: …</p>\n"
+        "         <p>⌂ Standplaats: …</p>\n"
+        "         <p>☠ Giftigheid: …</p>\n"
+        "     – Dit zijn zwart-wit Unicode symbolen (geen gekleurde emoji). Laat de 4 regels altijd staan; "
+        "       als informatie ontbreekt, schrijf ‘Onbekend’.\n"
+        "  • Optioneel kun je afsluiten met 1 extra <p> met een korte verzorgingstip.\n"
+        "  • Gebruik uitsluitend schone, eenvoudige HTML (<h3>, <p>, <strong>, <em>); geen <ul>/<li>, geen inline-styles, geen H1.\n\n"
 
         "SEO-UITGANGSPUNTEN:\n"
         "  • Verwerk relevante zoekwoorden (kamerplanten/tuinplanten; voor ‘Boeketten’: bloemen/boeketten) natuurlijk in titel en tekst.\n"
@@ -113,9 +115,8 @@ def openai_chat_with_backoff(system_prompt: str, user_prompt: str, model: str = 
         except urllib.error.HTTPError as e:
             code = getattr(e, 'code', None)
             if code == 429 and attempt < OPENAI_MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)  # backoff: 1,2,4,...
+                time.sleep(2 ** attempt)  # backoff: 1, 2, 4, ...
                 continue
-            # Andere HTTP-fouten
             try:
                 detail = e.read().decode('utf-8', 'ignore')
             except Exception:
@@ -269,9 +270,18 @@ def split_ai_output(text: str) -> Dict[str, str]:
     meta_desc = (meta_desc or meta_title)[:155]
 
     # Body naar eenvoudige HTML als er geen tags in staan
-    if body and not re.search(r"</?(p|ul|li|strong|em|br|h[2-6])\b", body, flags=re.I):
-        paras = [f"<p>{html.escape(p.strip())}</p>" for p in re.split(r"\n\s*\n", body) if p.strip()]
-        body = "\n".join(paras)
+    if body and not re.search(r"</?(p|h3|strong|em|br)\b", body, flags=re.I):
+        # maak minimale structuur met vereiste h3’s en de 4 regels
+        safe = html.escape(body)
+        body = (
+            "<h3>Beschrijving</h3>\n"
+            f"<p>{safe}</p>\n"
+            "<h3>Eigenschappen & behoeften</h3>\n"
+            "<p>☀ Lichtbehoefte: Onbekend</p>\n"
+            "<p>∿ Waterbehoefte: Onbekend</p>\n"
+            "<p>⌂ Standplaats: Onbekend</p>\n"
+            "<p>☠ Giftigheid: Onbekend</p>"
+        )
 
     return {
         'title': title,
@@ -281,7 +291,7 @@ def split_ai_output(text: str) -> Dict[str, str]:
     }
 
 # -------------------------------
-# UI (HTML)  (we gebruiken placeholders [[STORE]], [[BATCH]], [[DELAY]])
+# UI (HTML)  (placeholders [[STORE]], [[MODEL]], [[BATCH]], [[DELAY]])
 # -------------------------------
 
 LOGIN_HTML = '''<!doctype html><html lang="nl"><head>
@@ -530,7 +540,15 @@ def api_optimize():
 
                         Taken:
                         1) Lever een nieuwe titel volgens het opgelegde TITELFORMAT.
-                        2) Lever een gestandaardiseerde productbeschrijving (200–250 woorden) in schone HTML (<p>, <ul>, <li>, <strong>, <em>).
+                        2) Lever een gestandaardiseerde productbeschrijving (200–250 woorden) in schone HTML met exact:
+                           <h3>Beschrijving</h3>
+                           <p>…korte inleiding (2–3 zinnen)…</p>
+                           <h3>Eigenschappen & behoeften</h3>
+                           <p>☀ Lichtbehoefte: …</p>
+                           <p>∿ Waterbehoefte: …</p>
+                           <p>⌂ Standplaats: …</p>
+                           <p>☠ Giftigheid: …</p>
+                           (géén bullets, géén <ul>/<li>; gebruik uitsluitend <h3> en <p> in dit blok)
                         3) Lever een Meta title (max 60 tekens).
                         4) Lever een Meta description (max 155 tekens).
 
