@@ -4,9 +4,10 @@
 # Metafields: auto-detectie (namespace/key/type) + fallback + mirroring
 # Transactiefocus: koopwoorden in meta's + USP-lijst (default: Gratis verzending vanaf €49)
 # Annuleren: client AbortController + server-side cancel flags
+# Naamkoppelingen: vaste NL → Latijn lijst (UI + afdwingen in titel waar relevant)
 
 import os, json, time, textwrap, html, re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, request, session, redirect, Response, jsonify
 import requests
 import urllib.request
@@ -52,6 +53,40 @@ TRANSACTIONAL_CLAIMS = [s.strip() for s in os.environ.get(
     'Gratis verzending vanaf €49|Vandaag besteld, snel in huis|30 dagen retour|Lokale kweker|Verse kwaliteit'
 ).split('|') if s.strip()]
 
+# Vaste NL → Latijn naamkoppelingen (default; UI toont als regels)
+NAME_MAP_DEFAULT = os.environ.get(
+    'NAME_MAP_DEFAULT',
+    # één regel per koppel; '|' is scheidingsteken
+    'paradijsvogelplant=Strelitzia|flamingoplant=Anthurium|slaapplant=Calathea|gatenplant=Monstera|'
+    'olifantsoor=Alocasia|hartbladige klimmer=Philodendron|hartjesplant=Philodendron scandens|'
+    'klimphilodendron=Philodendron scandens|vrouwentong=Sansevieria|sanseveria=Sansevieria|'
+    'vioolbladplant=Ficus lyrata|drakenboom=Dracaena|zz-plant=Zamioculcas zamiifolia|'
+    'zz plant=Zamioculcas zamiifolia|zzplant=Zamioculcas zamiifolia|pannenkoekenplant=Pilea peperomioides|'
+    'lepelplant=Spathiphyllum wallisii|vredeslelie=Spathiphyllum wallisii|rubberplant=Ficus elastica|'
+    'rubberboom=Ficus elastica|treurvijg=Ficus benjamina|ficus ginseng=Ficus microcarpa|luchtplantje=Tillandsia|'
+    'graslelie=Chlorophytum comosum|bananenplant=Musa|arecapalm=Dypsis lutescens|goudpalm=Dypsis lutescens|'
+    'kentia=Howea forsteriana|kamerpalm=Chamaedorea elegans|bergpalm=Chamaedorea elegans|'
+    'dwergdadelpalm=Phoenix roebelenii|bamboepalm=Rhapis excelsa|vissenstaartpalm=Caryota mitis|'
+    'olifantspoot=Beaucarnea recurvata|flessenboom=Beaucarnea recurvata|jadeplant=Crassula ovata|'
+    'jadeboom=Crassula ovata|peperomia watermeloen=Peperomia argyreia|watermeloen peperomia=Peperomia argyreia|'
+    'mozaïekplant=Fittonia albivenis|gebedplant=Maranta leuconeura|schildpadplantje=Peperomia prostrata|'
+    'string of hearts=Ceropegia woodii|erwtenplantje=Senecio rowleyanus|dolfijnenplant=Senecio peregrinus|'
+    'koraalcactus=Rhipsalis|kerstcactus=Schlumbergera|paascactus=Rhipsalidopsis gaertneri|klimop=Hedera helix|'
+    'sierasperge=Asparagus setaceus|wasbloem=Hoya carnosa|goudrank=Epipremnum aureum|pothos=Epipremnum aureum|'
+    "devil's ivy=Epipremnum aureum|zilverrank=Scindapsus pictus|satijnplant=Scindapsus pictus|"
+    'klaverplant=Oxalis triangularis|paarse klaver=Oxalis triangularis|vlinderklaver=Oxalis triangularis|'
+    'krulvaren=Nephrolepis exaltata|bostonvaren=Nephrolepis exaltata|vogelnestvaren=Asplenium nidus|'
+    'venushaar=Adiantum raddianum|geweihvaren=Platycerium bifurcatum|alocasia polly=Alocasia amazonica|'
+    'pijlplant=Syngonium podophyllum|pijlwortel=Syngonium podophyllum|ezelsstaart=Sedum morganianum|'
+    'kalanchoë=Kalanchoe blossfeldiana|koffieplant=Coffea arabica|olijfboom=Olea europaea|laurier=Laurus nobilis|'
+    'oleander=Nerium oleander|Chinese roos=Hibiscus rosa-sinensis|kaapse jasmijn=Gardenia jasminoides|'
+    'kamerjasmijn=Jasminum polyanthum|bruidsbloem=Stephanotis floribunda|vingerboom=Schefflera arboricola|'
+    'parapluplant=Schefflera arboricola|vingerplant=Fatsia japonica|kameraralia=Polyscias scutellaria|'
+    'aralia=Polyscias scutellaria|clusia=Clusia rosea|stromanthe=Stromanthe sanguinea|'
+    'aloë vera=Aloe barbadensis|aloe vera=Aloe barbadensis|aloë=Aloe|snake plant=Sansevieria|'
+    'peace lily=Spathiphyllum wallisii|bananenketting=Curio radicans|string of bananas=Curio radicans'
+)
+
 # -------------------------------
 # Cancel administratie
 # -------------------------------
@@ -89,25 +124,25 @@ def require_login(fn):
     return wrapper
 
 
-def build_system_prompt(txn_mode: bool = False, txn_usps: Optional[List[str]] = None) -> str:
-    """System prompt – titel-format + vaste secties + optionele transactiefocus voor meta's."""
+def build_system_prompt(txn_mode: bool = False,
+                        txn_usps: Optional[List[str]] = None,
+                        name_map: Optional[Dict[str, str]] = None) -> str:
+    """System prompt – flexibele titel + vaste secties + optionele transactiefocus + naamkoppelingen."""
     txn_usps = [u for u in (txn_usps or []) if u]
+    name_map = name_map or {}
 
     base = (
         "Je bent een ervaren Nederlandstalige SEO-copywriter voor een plantenwebshop (Belle Flora). "
         "Schrijf klantgericht, natuurlijk en informatief. Optimaliseer subtiel voor SEO zonder keyword stuffing. "
         "Gebruik correcte plantennamen en wees feitelijk; verzin geen gegevens.\n\n"
 
-        "TITELFORMAT – ALTIJD DIT PATROON GEBRUIKEN:\n"
-        "  [Generieke naam] / [Latijnse naam] – ↕[hoogte in cm] – ⌀[pot diameter in cm]\n"
-        "  Als de plant in een sierpot zit: voeg toe na pot diameter: '– in [kleur] pot'.\n"
-        "  Voorbeeld zonder pot: Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27cm\n"
-        "  Voorbeeld met pot:   Gatenplant / Monstera Deliciosa – ↕150cm – ⌀27cm – in bruine pot\n"
-        "Regels:\n"
-        "  • Gebruik altijd de generieke NL-naam + Latijnse naam in die volgorde.\n"
-        "  • Hoogte en potdiameter alleen invullen als je ze aantoonbaar kunt afleiden uit titel, variant of beschrijving. "
-        "    Als een waarde onbekend is, laat dat blok dan weg in de titel (liever niets dan gokken).\n"
-        "  • Gebruik het ‘–’ (en dash) tussen blokken en de symbolen ↕ en ⌀.\n\n"
+        "TITELFORMAT – BIJ VOORKEUR:\n"
+        "  Gebruik waar zinvol het patroon: [Generieke NL-naam] / [Latijnse naam] – ↕[hoogte in cm] – ⌀[potdiameter in cm].\n"
+        "  Als de Latijnse naam niet relevant of niet zeker is, mag je ook alleen de duidelijkste productnaam gebruiken (NL of Latijn).\n"
+        "  Als de plant in een sierpot zit: voeg optioneel toe: '– in [kleur] pot'.\n"
+        "Voorbeelden:\n"
+        "  • Gatenplant / Monstera – ↕150cm – ⌀27\n"
+        "  • Strelitzia – ↕120cm – ⌀24  (alleen Latijn waar dat gangbaar is)\n\n"
 
         "BESCHRIJVING – HTML-LAYOUT (vast stramien):\n"
         "  • Gebruik exact deze secties met <h3>-kopjes en 4 regels zonder bullets:\n"
@@ -124,18 +159,25 @@ def build_system_prompt(txn_mode: bool = False, txn_usps: Optional[List[str]] = 
         "  • Elke tekst moet uniek zijn per product.\n\n"
     )
 
+    nm = ""
+    if name_map:
+        nm_lines = "\n".join([f"  • {k} → {v}" for k, v in name_map.items()])
+        nm = (
+            "NAAMCONSISTENTIE (toepassen wanneer relevant):\n"
+            "  Gebruik onderstaande vaste koppelingen tussen Nederlandse en Latijnse namen. "
+            "  Als de NL-naam voorkomt, gebruik EXACT de gekoppelde Latijnse naam (correct gespeld).\n"
+            f"{nm_lines}\n\n"
+        )
+
     txn = ""
     if txn_mode:
         usps = " • ".join(txn_usps) if txn_usps else ""
         txn = (
             "TRANSACTIONELE FOCUS VOOR META-TAGS:\n"
-            "  • Gebruik koopgerichte trefwoorden (bijv. Koop, Bestel, Shop, Online, Nu) waar natuurlijk.\n"
-            "  • Meta title (≤60): begin waar mogelijk met een koopwoord + productnaam; merk aan het eind mag als er ruimte is (| Belle Flora). "
-            "Geen schreeuwerige hoofdletters of uitroeptekens.\n"
-            "  • Meta description (≤155): voeg 1–2 korte USP's toe en een subtiele call-to-action (Bestel nu / Shop online). "
-            "Gebruik alleen USP's uit de volgende lijst en verzin niets: "
-            f"{usps if usps else '[geen USP-lijst opgegeven]'}\n"
-            "  • Doe geen prijs- of leverbelofte tenzij expliciet in de USP-lijst vermeld.\n\n"
+            "  • Gebruik waar natuurlijk koopgerichte trefwoorden (Koop/Bestel/Shop/Online/Nu).\n"
+            "  • Meta title (≤60): bij voorkeur begin met koopwoord + product; merk aan het eind (| Belle Flora) als er ruimte is.\n"
+            "  • Meta description (≤155): voeg 1–2 USP's toe en subtiele CTA. Alleen onderstaande USP-lijst gebruiken: "
+            f"{usps if usps else '[geen USP-lijst opgegeven]'}\n\n"
         )
 
     closing = (
@@ -146,7 +188,7 @@ def build_system_prompt(txn_mode: bool = False, txn_usps: Optional[List[str]] = 
         "Meta description: …\n"
     )
 
-    return base + txn + closing
+    return base + nm + txn + closing
 
 
 def openai_chat_with_backoff(system_prompt: str, user_prompt: str, model: str = DEFAULT_MODEL,
@@ -400,7 +442,7 @@ def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
 
 def shopify_product_metafields(token: str, store_domain: str, product_id_int: int) -> Dict[str, Any]:
     """Lees huidige waarden volgens de beste gok (top-kandidaat)."""
-    mm = _ensure_meta_map(token, store)
+    mm = _ensure_meta_map(token, store_domain)
     gid = f"gid://shopify/Product/{int(product_id_int)}"
     url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
     query = """
@@ -431,7 +473,7 @@ def _encode_value_for_type(val_str: str, tname: str) -> str:
     return str(val_str)
 
 
-def _try_set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname: str, value_str: str) -> tuple[bool, str]:
+def _try_set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname: str, value_str: str) -> Tuple[bool, str]:
     """Probeer één metafield te zetten; retourneer (ok, foutmelding)."""
     url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
     mutation = """
@@ -578,8 +620,58 @@ def split_ai_output(text: str) -> Dict[str, str]:
         'meta_description': meta_desc,
     }
 
+# ---------- Naamkoppelingen helpers ----------
+
+def parse_name_map_text(txt: str) -> Dict[str, str]:
+    """
+    Parseer 'nl=Latijn' paren uit tekst (gescheiden door nieuwe regels of |).
+    Regels die met # beginnen worden genegeerd. Keys zijn case-insensitive.
+    """
+    if not txt:
+        return {}
+    pairs = re.split(r"[|\n]+", txt)
+    out: Dict[str, str] = {}
+    for raw in pairs:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        nl, la = line.split("=", 1)
+        nl_key = nl.strip().lower()
+        la_val = la.strip()
+        if nl_key and la_val:
+            out[nl_key] = la_val
+    return out
+
+
+def enforce_title_name_map(title: str, name_map: Dict[str, str]) -> str:
+    """
+    Als titel het patroon 'NL / Latijn – …' volgt en de NL-naam matcht een key,
+    vervang dan de Latijnse naam door de opgegeven waarde.
+    """
+    if not title or not name_map:
+        return title
+
+    # match: [NL] / [Latijn] – rest
+    m = re.match(r"^\s*([^/\n]+?)\s*/\s*([^–—\-]+?)\s*(?:–|—|-)\s*(.*)$", title)
+    if not m:
+        return title
+
+    nl = m.group(1).strip()
+    lat = m.group(2).strip()
+    rest = m.group(3)
+
+    nl_low = nl.lower()
+    for k, v in name_map.items():
+        if k in nl_low:
+            if lat != v:
+                return f"{nl} / {v}" + (f" – {rest}" if rest else "")
+            break
+    return title
+
 # -------------------------------
-# UI (HTML)  (placeholders [[STORE]], [[MODEL]], [[BATCH]], [[DELAY]], [[TXNUSPS]], [[TXNCHECKED]])
+# UI (HTML)  (placeholders [[STORE]], [[MODEL]], [[BATCH]], [[DELAY]], [[TXNUSPS]], [[TXNCHECKED]], [[NAMEMAP]])
 # -------------------------------
 
 LOGIN_HTML = '''<!doctype html><html lang="nl"><head>
@@ -653,6 +745,13 @@ small{opacity:.85}
     </div>
   </div>
 
+  <div class="row">
+    <div style="grid-column: 1 / -1;">
+      <label>Vaste naamkoppelingen NL → Latijn (één per regel, formaat: <code>nl=Latijn</code>)</label>
+      <textarea id="name_map" rows="6" placeholder="gatenplant=Monstera deliciosa&#10;aloe vera=Aloe barbadensis">[[NAMEMAP]]</textarea>
+    </div>
+  </div>
+
   <div style="margin-top:10px">
     <button onclick="loadCollections()">Collecties laden</button>
     <span id="cstatus" class="pill">Nog niet geladen</span>
@@ -684,7 +783,7 @@ window.addEventListener('DOMContentLoaded', () => {
   qs('#txn').checked = DEFAULT_TXN_CHECKED;
 });
 
-/* === Nieuw: run state + AbortController === */
+/* Run state + AbortController */
 let RUNNING = false;
 let abortCtrl = null;
 let currentJobId = null;
@@ -734,6 +833,7 @@ async function optimizeSelected(){
       collection_ids: ids,
       txn: qs('#txn').checked,
       txn_usps: qs('#txn_usps').value,
+      name_map: qs('#name_map').value,
       job_id: currentJobId
     })
   });
@@ -801,7 +901,8 @@ def dashboard():
             .replace('[[BATCH]]', str(BATCH_SIZE))
             .replace('[[DELAY]]', f"{DELAY_PER_PRODUCT:.1f}")
             .replace('[[TXNUSPS]]', " | ".join(TRANSACTIONAL_CLAIMS))
-            .replace('[[TXNCHECKED]]', 'true' if TRANSACTIONAL_MODE else 'false'))
+            .replace('[[TXNCHECKED]]', 'true' if TRANSACTIONAL_MODE else 'false')
+            .replace('[[NAMEMAP]]', NAME_MAP_DEFAULT.replace('|', '\n')))
     return Response(html, mimetype='text/html')
 
 
@@ -860,6 +961,10 @@ def api_optimize():
     txn_usps_input = payload.get('txn_usps') or ""
     txn_usps = [s.strip() for s in txn_usps_input.split('|') if s.strip()] or TRANSACTIONAL_CLAIMS
 
+    # Naamkoppelingen
+    name_map_text = (payload.get('name_map') or NAME_MAP_DEFAULT.replace('|', '\n'))
+    name_map = parse_name_map_text(name_map_text)
+
     # Cancel administratie
     job_id = (payload.get('job_id') or str(uuid4())).strip()
     job_start(job_id)
@@ -871,7 +976,7 @@ def api_optimize():
         job_end(job_id)
         return Response("OPENAI_API_KEY ontbreekt in de server-omgeving.\n", mimetype='text/plain', status=500)
 
-    sys_prompt = build_system_prompt(txn_mode=txn_mode, txn_usps=txn_usps)
+    sys_prompt = build_system_prompt(txn_mode=txn_mode, txn_usps=txn_usps, name_map=name_map)
 
     def generate():
         try:
@@ -883,6 +988,7 @@ def api_optimize():
                 h2 = ", ".join(map(_fmt, mm_dbg.get("height_candidates", [])[:2])) or "-"
                 d1 = ", ".join(map(_fmt, mm_dbg.get("diam_candidates", [])[:1])) or "-"
                 yield f"Metafields mapping → Hoogte-kandidaten: {h2}; Diameter-kandidaat: {d1}\n"
+            yield f"Naamkoppelingen: {len(name_map)} actief\n"
 
             if job_is_cancelled(job_id):
                 yield "⏹ Geannuleerd vóór start verwerking.\n"
@@ -932,7 +1038,7 @@ def api_optimize():
                         Tags: {tags}
 
                         Taken:
-                        1) Lever een nieuwe titel volgens het opgelegde TITELFORMAT.
+                        1) Lever een nieuwe titel (flexibel: bij voorkeur 'NL / Latijn – ↕… – ⌀…', maar alleen NL of Latijn mag ook).
                         2) Lever een gestandaardiseerde productbeschrijving (200–250 woorden) in schone HTML met exact:
                            <h3>Beschrijving</h3>
                            <p>…korte inleiding (2–3 zinnen)…</p>
@@ -964,6 +1070,9 @@ def api_optimize():
                         yield f"→ #{pid}: AI-tekst genereren...\n"
                         out = openai_chat_with_backoff(sys_prompt, final_prompt, model=model, temperature=DEFAULT_TEMPERATURE)
                         pieces = split_ai_output(out)
+
+                        # Titel: afdwingen NL→Latijn mapping waar relevant
+                        pieces['title'] = enforce_title_name_map(pieces['title'] or title, name_map)
 
                         # 4a) Shopify: titel/HTML/SEO updaten
                         _ = shopify_graphql_update_product(
