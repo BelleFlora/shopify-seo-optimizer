@@ -18,18 +18,17 @@ app.secret_key = os.environ.get('FLASK_SECRET', os.urandom(32))
 
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'michiel')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'CHANGE_ME')
-SHOPIFY_STORE_DOMAIN = os.environ.get('SHOPIFY_STORE_DOMAIN', 'your-store.myshopify.com')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')  # server-side, niet in UI tonen
+SHOPIFY_STORE_DOMAIN = os.environ.get('SHOPIFY_STORE_DOMAIN', 'your-store.myshopify.com').strip()
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '').strip()  # server-side, niet in UI tonen
 
-DEFAULT_MODEL = 'gpt-4o-mini'
-DEFAULT_TEMPERATURE = 0.7
+DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-4o-mini')
+DEFAULT_TEMPERATURE = float(os.environ.get('DEFAULT_TEMPERATURE', '0.7'))
 
 # Batch/vertragingsinstellingen
-BATCH_SIZE = 8            # aantal producten per API-read batch
-DELAY_PER_PRODUCT = 2.5   # seconden pauze tussen producten (rate-limit vriendelijk)
-OPENAI_MAX_RETRIES = 4
-SHOPIFY_MAX_RETRIES = 4
-
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '8'))          # aantal producten per API-read batch
+DELAY_PER_PRODUCT = float(os.environ.get('DELAY_SECONDS', '2.5'))  # pauze tussen producten
+OPENAI_MAX_RETRIES = int(os.environ.get('OPENAI_MAX_RETRIES', '4'))
+SHOPIFY_MAX_RETRIES = int(os.environ.get('SHOPIFY_MAX_RETRIES', '4'))
 
 # -------------------------------
 # Helpers
@@ -117,7 +116,11 @@ def openai_chat_with_backoff(system_prompt: str, user_prompt: str, model: str = 
                 time.sleep(2 ** attempt)  # backoff: 1,2,4,...
                 continue
             # Andere HTTP-fouten
-            raise RuntimeError(f"OpenAI call failed: HTTP Error {code}: {e.read().decode('utf-8', 'ignore')}")
+            try:
+                detail = e.read().decode('utf-8', 'ignore')
+            except Exception:
+                detail = ''
+            raise RuntimeError(f"OpenAI call failed: HTTP {code}: {detail}")
         except Exception as e:
             if attempt < OPENAI_MAX_RETRIES - 1:
                 time.sleep(2 ** attempt)
@@ -137,32 +140,24 @@ def shopify_get_with_backoff(url: str, token: str, params: Dict[str, Any] = None
     for attempt in range(SHOPIFY_MAX_RETRIES):
         r = requests.get(url, headers=shopify_headers(token), params=params or {}, timeout=60)
         if r.status_code == 429 and attempt < SHOPIFY_MAX_RETRIES - 1:
-            # respecteer 'Retry-After' indien aanwezig
             retry_after = float(r.headers.get('Retry-After', 2 ** attempt))
             time.sleep(retry_after)
             continue
         r.raise_for_status()
         return r
-    # laatste poging raise_for_status
     r.raise_for_status()
     return r
 
 
 def shopify_post_graphql_with_backoff(url: str, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     for attempt in range(SHOPIFY_MAX_RETRIES):
-        r = requests.post(
-            url,
-            headers=shopify_headers(token),
-            json=payload,
-            timeout=60
-        )
+        r = requests.post(url, headers=shopify_headers(token), json=payload, timeout=60)
         if r.status_code == 429 and attempt < SHOPIFY_MAX_RETRIES - 1:
             retry_after = float(r.headers.get('Retry-After', 2 ** attempt))
             time.sleep(retry_after)
             continue
         r.raise_for_status()
-        data = r.json()
-        return data
+        return r.json()
     r.raise_for_status()
     return r.json()
 
@@ -228,7 +223,6 @@ def split_ai_output(text: str) -> Dict[str, str]:
     lines = [l.strip() for l in text.splitlines()]
     blob = "\n".join(lines)
 
-    # markers zoeken (case-insensitive)
     def find_marker(name_variants: List[str]) -> str:
         for m in name_variants:
             if m.lower() in blob.lower():
@@ -264,7 +258,6 @@ def split_ai_output(text: str) -> Dict[str, str]:
     meta_title = extract(markers['meta_title'], [markers['meta_desc']])
     meta_desc = extract(markers['meta_desc'], [])
 
-    # fallback als markers niet gevonden
     if not title and not body and not meta_title and not meta_desc:
         parts = [p.strip() for p in re.split(r"\n\s*\n", blob) if p.strip()]
         title = parts[0] if len(parts) > 0 else ''
@@ -272,12 +265,11 @@ def split_ai_output(text: str) -> Dict[str, str]:
         meta_title = parts[2] if len(parts) > 2 else title[:60]
         meta_desc = parts[3] if len(parts) > 3 else (body[:155] if body else title[:155])
 
-    # beperkingen meta
     meta_title = (meta_title or title)[:60]
     meta_desc = (meta_desc or meta_title)[:155]
 
-    # zorg dat body HTML is: als het geen tags bevat, maak simpele paragrafen
-    if body and not re.search(r"</?(p|ul|li|strong|em|br)\b", body, flags=re.I):
+    # Body naar eenvoudige HTML als er geen tags in staan
+    if body and not re.search(r"</?(p|ul|li|strong|em|br|h[2-6])\b", body, flags=re.I):
         paras = [f"<p>{html.escape(p.strip())}</p>" for p in re.split(r"\n\s*\n", body) if p.strip()]
         body = "\n".join(paras)
 
@@ -288,9 +280,8 @@ def split_ai_output(text: str) -> Dict[str, str]:
         'meta_description': meta_desc,
     }
 
-
 # -------------------------------
-# UI (HTML)
+# UI (HTML)  (we gebruiken placeholders [[STORE]], [[BATCH]], [[DELAY]])
 # -------------------------------
 
 LOGIN_HTML = '''<!doctype html><html lang="nl"><head>
@@ -336,11 +327,11 @@ small{opacity:.85}
   <div class="row">
     <div>
       <label>Store domein</label>
-      <input id="store" value="{store}" />
+      <input id="store" value="[[STORE]]" />
     </div>
     <div>
       <label>Model (server-side)</label>
-      <input id="model" value="gpt-4o-mini" />
+      <input id="model" value="[[MODEL]]" />
     </div>
   </div>
   <div class="row">
@@ -368,7 +359,7 @@ small{opacity:.85}
 </div>
 
 <div class="card">
-  <small>Live status (batch={batch}, delay={delay:.1f}s, model=server-side)</small>
+  <small>Live status (batch=[[BATCH]], delay=[[DELAY]]s, model=server-side)</small>
   <pre id="status">Klaar om te starten…</pre>
 </div>
 
@@ -389,6 +380,7 @@ async function loadCollections(){
     })
   });
   const data = await res.json();
+  if(data.error){ setLog('❌ ' + data.error); return; }
   const sel = qs('#collections'); sel.innerHTML = '';
   (data.collections || []).forEach(c => {
     const opt = document.createElement('option');
@@ -424,7 +416,6 @@ async function optimizeSelected(){
 </script>
 </body></html>'''
 
-
 # -------------------------------
 # Routes
 # -------------------------------
@@ -449,7 +440,11 @@ def root():
 @app.route('/dashboard')
 @require_login
 def dashboard():
-    html = DASHBOARD_HTML.format(store=SHOPIFY_STORE_DOMAIN, batch=BATCH_SIZE, delay=DELAY_PER_PRODUCT)
+    html = (DASHBOARD_HTML
+            .replace('[[STORE]]', SHOPIFY_STORE_DOMAIN)
+            .replace('[[MODEL]]', DEFAULT_MODEL)
+            .replace('[[BATCH]]', str(BATCH_SIZE))
+            .replace('[[DELAY]]', f"{DELAY_PER_PRODUCT:.1f}"))
     return Response(html, mimetype='text/html')
 
 
@@ -462,12 +457,13 @@ def logout():
 @app.route('/api/collections', methods=['POST'])
 @require_login
 def api_collections():
+    global SHOPIFY_STORE_DOMAIN  # <-- belangrijk: vóór gebruik declareren
+
     payload = request.get_json(force=True)
     store = (payload.get('store') or SHOPIFY_STORE_DOMAIN).strip()
     token = (payload.get('token') or '').strip()
 
-    global SHOPIFY_STORE_DOMAIN
-    SHOPIFY_STORE_DOMAIN = store
+    SHOPIFY_STORE_DOMAIN = store  # update de globale store voor volgende calls
 
     if not token:
         return jsonify({'error': 'Geen Shopify token meegegeven.'}), 400
@@ -527,7 +523,6 @@ def api_optimize():
                     body_html = p.get('body_html', '') or ''
                     tags = p.get('tags', '') or ''
 
-                    # 3) Prompt bouwen (base) – HTML gevraagd, labels vereist
                     base_prompt = textwrap.dedent(f"""
                         Originele titel: {title}
                         Originele beschrijving (HTML toegestaan): {body_html}
@@ -555,7 +550,6 @@ def api_optimize():
                         out = openai_chat_with_backoff(sys_prompt, final_prompt, model=model, temperature=DEFAULT_TEMPERATURE)
                         pieces = split_ai_output(out)
 
-                        # 4) Shopify GraphQL update
                         _ = shopify_graphql_update_product(
                             store_domain=store,
                             access_token=token,
@@ -573,7 +567,6 @@ def api_optimize():
                     except Exception as e:
                         yield f"❌ OpenAI/Shopify-fout bij product #{pid}: {e}\n"
 
-                    # Rate-limit vriendelijk
                     time.sleep(DELAY_PER_PRODUCT)
 
                 yield f"-- Batch klaar ({len(prods)} producten) --\n"
@@ -595,7 +588,7 @@ def healthz():
 
 
 # -------------------------------
-# Main (optioneel)
+# Main (lokaal)
 # -------------------------------
 
 if __name__ == '__main__':
