@@ -3,6 +3,7 @@
 # NL UI • Login via env vars • Server-side OpenAI key • Collectie-selectie • Batching • Backoff • GraphQL updates
 # Metafields: auto-detectie (namespace/key/type) + fallback + mirroring
 # Transactiefocus: koopwoorden in meta's + USP-lijst (default: Gratis verzending vanaf €49)
+# Annuleren: client AbortController + server-side cancel flags
 
 import os, json, time, textwrap, html, re
 from typing import List, Dict, Any, Optional
@@ -10,6 +11,8 @@ from flask import Flask, request, session, redirect, Response, jsonify
 import requests
 import urllib.request
 import urllib.error
+from uuid import uuid4
+from threading import Lock
 
 # -------------------------------
 # Config & App
@@ -48,6 +51,30 @@ TRANSACTIONAL_CLAIMS = [s.strip() for s in os.environ.get(
     'TRANSACTIONAL_CLAIMS',
     'Gratis verzending vanaf €49|Vandaag besteld, snel in huis|30 dagen retour|Lokale kweker|Verse kwaliteit'
 ).split('|') if s.strip()]
+
+# -------------------------------
+# Cancel administratie
+# -------------------------------
+
+CANCEL_FLAGS: Dict[str, bool] = {}
+CANCEL_LOCK = Lock()
+
+def job_start(job_id: str):
+    with CANCEL_LOCK:
+        CANCEL_FLAGS[job_id] = False
+
+def job_cancel(job_id: str):
+    with CANCEL_LOCK:
+        if job_id in CANCEL_FLAGS:
+            CANCEL_FLAGS[job_id] = True
+
+def job_is_cancelled(job_id: str) -> bool:
+    with CANCEL_LOCK:
+        return CANCEL_FLAGS.get(job_id, False)
+
+def job_end(job_id: str):
+    with CANCEL_LOCK:
+        CANCEL_FLAGS.pop(job_id, None)
 
 # -------------------------------
 # Helpers
@@ -373,7 +400,7 @@ def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
 
 def shopify_product_metafields(token: str, store_domain: str, product_id_int: int) -> Dict[str, Any]:
     """Lees huidige waarden volgens de beste gok (top-kandidaat)."""
-    mm = _ensure_meta_map(token, store_domain)
+    mm = _ensure_meta_map(token, store)
     gid = f"gid://shopify/Product/{int(product_id_int)}"
     url = f"https://{store_domain}/admin/api/2025-01/graphql.json"
     query = """
@@ -636,7 +663,8 @@ small{opacity:.85}
   <label>Selecteer collecties</label>
   <select id="collections" multiple size="10" style="height:220px"></select>
   <div style="margin-top:12px">
-    <button onclick="optimizeSelected()">Optimaliseer geselecteerde producten</button>
+    <button id="btnRun" onclick="optimizeSelected()">Optimaliseer geselecteerde producten</button>
+    <button id="btnCancel" onclick="cancelRun()" disabled>Annuleren</button>
   </div>
 </div>
 
@@ -651,10 +679,15 @@ const qs = s => document.querySelector(s);
 function setLog(t){qs('#status').textContent = t}
 function addLog(t){qs('#status').textContent += '\\n' + t}
 
-const DEFAULT_TXN_CHECKED = [[TXNCHECKED]]; // boolean literal (true/false)
+const DEFAULT_TXN_CHECKED = [[TXNCHECKED]];
 window.addEventListener('DOMContentLoaded', () => {
   qs('#txn').checked = DEFAULT_TXN_CHECKED;
 });
+
+/* === Nieuw: run state + AbortController === */
+let RUNNING = false;
+let abortCtrl = null;
+let currentJobId = null;
 
 async function loadCollections(){
   setLog('Collecties laden…');
@@ -680,11 +713,19 @@ async function loadCollections(){
 }
 
 async function optimizeSelected(){
+  if (RUNNING) return;
   setLog('Start optimalisatie…');
+  RUNNING = true;
+  abortCtrl = new AbortController();
+  currentJobId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
+  qs('#btnCancel').disabled = false;
+  qs('#btnRun').disabled = true;
+
   const ids = Array.from(qs('#collections').selectedOptions).map(o => o.value);
   const res = await fetch('/api/optimize', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
+    signal: abortCtrl.signal,
     body: JSON.stringify({
       store: qs('#store').value.trim(),
       token: qs('#token').value.trim(),
@@ -692,15 +733,40 @@ async function optimizeSelected(){
       prompt: qs('#prompt').value,
       collection_ids: ids,
       txn: qs('#txn').checked,
-      txn_usps: qs('#txn_usps').value
+      txn_usps: qs('#txn_usps').value,
+      job_id: currentJobId
     })
   });
-  const rd = res.body.getReader(); const dec = new TextDecoder();
-  while(true){
-    const {value, done} = await rd.read();
-    if(done) break;
-    addLog(dec.decode(value));
+
+  try {
+    const rd = res.body.getReader(); const dec = new TextDecoder();
+    while(true){
+      const {value, done} = await rd.read();
+      if(done) break;
+      addLog(dec.decode(value));
+    }
+  } catch (e) {
+    addLog('⏹ Gestopt: ' + (e?.name || 'onderbroken'));
+  } finally {
+    RUNNING = false;
+    qs('#btnCancel').disabled = true;
+    qs('#btnRun').disabled = false;
+    abortCtrl = null;
+    currentJobId = null;
   }
+}
+
+async function cancelRun(){
+  if (!RUNNING) return;
+  addLog('⏹ Annuleren aangevraagd…');
+  try {
+    await fetch('/api/cancel', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ job_id: currentJobId })
+    });
+  } catch (e) {}
+  try { abortCtrl?.abort(); } catch(e){}
 }
 </script>
 </body></html>'''
@@ -765,6 +831,17 @@ def api_collections():
     return jsonify({'collections': cols})
 
 
+@app.route('/api/cancel', methods=['POST'])
+@require_login
+def api_cancel():
+    payload = request.get_json(force=True) or {}
+    job_id = (payload.get('job_id') or '').strip()
+    if not job_id:
+        return jsonify({'error': 'job_id ontbreekt'}), 400
+    job_cancel(job_id)
+    return jsonify({'ok': True})
+
+
 @app.route('/api/optimize', methods=['POST'])
 @require_login
 def api_optimize():
@@ -783,15 +860,22 @@ def api_optimize():
     txn_usps_input = payload.get('txn_usps') or ""
     txn_usps = [s.strip() for s in txn_usps_input.split('|') if s.strip()] or TRANSACTIONAL_CLAIMS
 
+    # Cancel administratie
+    job_id = (payload.get('job_id') or str(uuid4())).strip()
+    job_start(job_id)
+
     if not token:
+        job_end(job_id)
         return Response("Shopify token ontbreekt.\n", mimetype='text/plain', status=400)
     if not OPENAI_API_KEY:
+        job_end(job_id)
         return Response("OPENAI_API_KEY ontbreekt in de server-omgeving.\n", mimetype='text/plain', status=500)
 
     sys_prompt = build_system_prompt(txn_mode=txn_mode, txn_usps=txn_usps)
 
     def generate():
         try:
+            yield f"Job: {job_id}\n"
             # 0) Toon (top) mapping – en de eerste 2 hoogte-kandidaten
             mm_dbg = _ensure_meta_map(token, store)
             if META_DEBUG_MAPPING:
@@ -799,6 +883,10 @@ def api_optimize():
                 h2 = ", ".join(map(_fmt, mm_dbg.get("height_candidates", [])[:2])) or "-"
                 d1 = ", ".join(map(_fmt, mm_dbg.get("diam_candidates", [])[:1])) or "-"
                 yield f"Metafields mapping → Hoogte-kandidaten: {h2}; Diameter-kandidaat: {d1}\n"
+
+            if job_is_cancelled(job_id):
+                yield "⏹ Geannuleerd vóór start verwerking.\n"
+                return
 
             # 1) Product-IDs verzamelen
             all_product_ids: List[int] = []
@@ -818,6 +906,10 @@ def api_optimize():
             # 2) In batches productdetails ophalen
             processed = 0
             for i in range(0, len(all_product_ids), BATCH_SIZE):
+                if job_is_cancelled(job_id):
+                    yield "⏹ Geannuleerd – batchverwerking gestopt.\n"
+                    return
+
                 batch_ids = all_product_ids[i:i + BATCH_SIZE]
                 ids_param = ','.join(map(str, batch_ids))
                 url = f'https://{store}/admin/api/2024-07/products.json'
@@ -825,6 +917,10 @@ def api_optimize():
                 prods = r.json().get('products', [])
 
                 for p in prods:
+                    if job_is_cancelled(job_id):
+                        yield "⏹ Geannuleerd – verwerking gestopt.\n"
+                        return
+
                     pid = int(p['id'])
                     title = p.get('title', '') or ''
                     body_html = p.get('body_html', '') or ''
@@ -861,6 +957,10 @@ def api_optimize():
                     final_prompt = (user_prompt_extra + "\n\n" + base_prompt).strip() if user_prompt_extra else base_prompt
 
                     try:
+                        if job_is_cancelled(job_id):
+                            yield "⏹ Geannuleerd – AI-call overgeslagen.\n"
+                            return
+
                         yield f"→ #{pid}: AI-tekst genereren...\n"
                         out = openai_chat_with_backoff(sys_prompt, final_prompt, model=model, temperature=DEFAULT_TEMPERATURE)
                         pieces = split_ai_output(out)
@@ -904,14 +1004,26 @@ def api_optimize():
                         yield f"❌ OpenAI/Shopify-fout bij product #{pid}: {e}\n"
 
                     time.sleep(DELAY_PER_PRODUCT)
+                    if job_is_cancelled(job_id):
+                        yield "⏹ Geannuleerd na product.\n"
+                        return
 
                 yield f"-- Batch klaar ({len(prods)} producten) --\n"
 
             yield f"\nKlaar. Totaal bijgewerkt: {processed}.\n"
         except Exception as e:
             yield f"⚠️ Beëindigd met fout: {e}\n"
+        finally:
+            job_end(job_id)
 
-    return Response(generate(), mimetype='text/plain')
+    return Response(
+        generate(),
+        mimetype='text/plain',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
 
 
 # -------------------------------
