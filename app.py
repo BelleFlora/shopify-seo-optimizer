@@ -1,21 +1,16 @@
 # app.py
-# Belle Flora SEO Optimizer – snel, robuust, en met inline heroicons.
-# - Parallelle OpenAI-calls (instelbaar via OPENAI_CONCURRENCY)
-# - Shopify updates sequentieel (veilig tegen rate-limits)
-# - Inline SVG iconen (zon, druppel, huis, waarschuwing) – geen CDN nodig
-# - Robuust: productfouten stoppen de job niet; batches lopen door
-# - Annuleren, transactiefocus, naamkoppelingen, pot-suffix, cm-fixes
-#
-# Env tips:
-#   OPENAI_CONCURRENCY=3..5
-#   DELAY_SECONDS=0.4 (of 0)
-#   HEROICON_SIZE=20..24
+# Belle Flora SEO Optimizer – sequentieel, stabiel en met inline heroicons.
+# - AI sequentieel (1 voor 1) voor maximale stabiliteit
+# - Annuleer-knop
+# - Inline SVG iconen (geen CDN nodig)
+# - Metafields autodetect + mirroring met type-conversie
+# - Pot-suffix, cm-fixes, transactiefocus, vaste NL→Latijn-koppelingen
+# - Robuuste streaming met eerste-byte “nudge” en goede UI-foutmeldingen
 
 import os, re, json, time, html, textwrap, traceback
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from threading import Lock
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from flask import Flask, Response, jsonify, redirect, request, session
@@ -35,7 +30,6 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("DEFAULT_MODEL", "gpt-4o-mini")
 OPENAI_TEMP = float(os.environ.get("DEFAULT_TEMPERATURE", "0.7"))
 OPENAI_RETRIES = int(os.environ.get("OPENAI_MAX_RETRIES", "4"))
-OPENAI_CONCURRENCY = int(os.environ.get("OPENAI_CONCURRENCY", "3"))  # parallelle AI-calls per batch
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 DELAY_PER_PRODUCT = float(os.environ.get("DELAY_SECONDS", "2.5"))
@@ -411,7 +405,6 @@ def finalize_meta_desc(raw: str, body_fallback: str, title_fallback: str, limit:
 # ---------- Inline SVG iconen (heroicons-stijl) + injectie ----------
 
 def _svg_attrs(name: str) -> str:
-    # uniforme stijl voor alle iconen
     return (f'class="bf-icon" data-heroicon="{name}" '
             f'width="{HEROICON_SIZE}" height="{HEROICON_SIZE}" viewBox="0 0 24 24" '
             'fill="none" stroke="currentColor" stroke-width="1.5" '
@@ -419,7 +412,6 @@ def _svg_attrs(name: str) -> str:
             'style="vertical-align:text-bottom;margin-right:6px;opacity:.95"')
 
 def _icon_svg(name: str) -> str:
-    # Simpele paths (lichter dan echte heroicons, maar stijl gelijkend)
     if name == "sun":
         return f'''<svg {_svg_attrs(name)}>
   <circle cx="12" cy="12" r="4"></circle>
@@ -457,11 +449,6 @@ ICON_MAP = {
 }
 
 def inject_heroicons(body_html: str) -> str:
-    """
-    Voeg vóór de 4 regels steeds een inline SVG-icoon toe.
-    - Stript eventuele emoji/img vóór het label.
-    - Idempotent: als .bf-icon/data-heroicon al aanwezig is, laat staan.
-    """
     if not body_html:
         return body_html
     if 'class="bf-icon"' in body_html or 'data-heroicon=' in body_html:
@@ -470,7 +457,6 @@ def inject_heroicons(body_html: str) -> str:
     out = body_html
 
     def _inject(label: str, icon_html: str, html: str) -> str:
-        # <p> [rommel] (<strong>)?Label(</strong>)? : rest </p>
         rx = re.compile(
             rf'(<p[^>]*>\s*)'
             rf'(?:<img[^>]*>\s*|<svg[^>]*>\s*</svg>\s*|[\u2600-\u27BF\u1F300-\u1FAFF\s]*?)*'
@@ -723,16 +709,43 @@ async function optimizeSelected(){
   if(RUN) return; RUN=true; abortCtrl=new AbortController();
   jobId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
   qs('#btnRun').disabled=true; qs('#btnCancel').disabled=false; setLog('Start optimalisatie…');
+
   const ids=Array.from(qs('#collections').selectedOptions).map(o=>o.value);
-  const res=await fetch('/api/optimize',{method:'POST',signal:abortCtrl.signal,headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({store:qs('#store').value.trim(), token:qs('#token').value.trim(), model:qs('#model').value.trim(),
-      prompt:qs('#prompt').value, collection_ids:ids, txn:qs('#txn').checked, txn_usps:qs('#txn_usps').value,
-      name_map:qs('#name_map').value, job_id:jobId})});
+  let res;
   try{
-    const rd=res.body.getReader(); const dec=new TextDecoder();
-    while(true){ const {value,done}=await rd.read(); if(done) break; addLog(dec.decode(value)); }
-  }catch(e){ addLog('⏹ Gestopt: '+(e?.name||'onderbroken')); }
-  finally{ RUN=false; qs('#btnRun').disabled=false; qs('#btnCancel').disabled=true; abortCtrl=null; jobId=null; }
+    res=await fetch('/api/optimize',{method:'POST',signal:abortCtrl.signal,headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({store:qs('#store').value.trim(), token:qs('#token').value.trim(), model:qs('#model').value.trim(),
+        prompt:qs('#prompt').value, collection_ids:ids, txn:qs('#txn').checked, txn_usps:qs('#txn_usps').value,
+        name_map:qs('#name_map').value, job_id:jobId})});
+  }catch(e){
+    addLog('❌ Netwerkfout: '+(e?.message||e)); 
+    RUN=false; qs('#btnRun').disabled=false; qs('#btnCancel').disabled=true; abortCtrl=null; jobId=null;
+    return;
+  }
+
+  if(!res.ok || !res.body){
+    let txt=''; try{ txt=await res.text(); }catch(_){}
+    addLog(`❌ HTTP ${res.status} ${res.statusText}${txt?'\n'+txt:''}`);
+    RUN=false; qs('#btnRun').disabled=false; qs('#btnCancel').disabled=true; abortCtrl=null; jobId=null;
+    return;
+  }
+
+  try{
+    const reader = res.body.getReader(); const dec = new TextDecoder();
+    let firstChunkSeen=false;
+    const watchdog=setTimeout(()=>{ if(!firstChunkSeen) addLog('…nog geen server-output ontvangen (proxy/buffering).'); },8000);
+    while(true){
+      const {value,done}=await reader.read();
+      if(done) break;
+      firstChunkSeen=true;
+      addLog(dec.decode(value));
+    }
+    clearTimeout(watchdog);
+  }catch(e){
+    addLog('⏹ Gestopt: '+(e?.name||e));
+  }finally{
+    RUN=false; qs('#btnRun').disabled=false; qs('#btnCancel').disabled=true; abortCtrl=null; jobId=null;
+  }
 }
 
 async function cancelRun(){
@@ -762,6 +775,8 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
     sys_prompt = _build_system_prompt(txn, txn_usps, name_map)
 
     def stream():
+        # nudge: stuur onmiddellijk bytes zodat proxies beginnen te streamen
+        yield " \n"
         try:
             yield f"Job: {job_id}\n"
             mm = _ensure_meta_map(token, store)
@@ -782,7 +797,7 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
                 all_pids = [int(p["id"]) for p in prods]
 
             yield f"Collecties: {len(collection_ids) or 0} geselecteerd — {len(all_pids)} producten gevonden\n"
-            yield f"Instellingen: batch={BATCH_SIZE}, delay={DELAY_PER_PRODUCT:.1f}s, model={model} (server-side), parallel AI={OPENAI_CONCURRENCY}\n"
+            yield f"Instellingen: batch={BATCH_SIZE}, delay={DELAY_PER_PRODUCT:.1f}s, model={model} (server-side)\n"
 
             processed = 0
             for i in range(0, len(all_pids), BATCH_SIZE):
@@ -792,13 +807,18 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
                 url = f"https://{store}/admin/api/2024-07/products.json"
                 prods = _get(url, token, {"ids": ids, "limit": 250}).json().get("products", [])
 
-                # --- AI prompts voorbereiden ---
-                jobs = []
+                yield f"   • AI-generatie (sequentieel) voor {len(prods)} items…\n"
+
                 for p in prods:
+                    if _cancel_check(job_id):
+                        yield "⏹ Geannuleerd.\n"
+                        break
+
                     pid = int(p['id'])
                     title = p.get('title', '') or ''
                     body_html = p.get('body_html', '') or ''
                     tags = p.get('tags', '') or ''
+
                     base_prompt = textwrap.dedent(f"""
                         Originele titel: {title}
                         Originele beschrijving (HTML toegestaan): {body_html}
@@ -826,49 +846,22 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
                         Meta description: …
                     """).strip()
                     final_prompt = (user_prompt + "\n\n" + base_prompt).strip() if user_prompt else base_prompt
-                    jobs.append((pid, title, body_html, final_prompt))
 
-                yield f"   • AI-generatie voor {len(jobs)} items (parallel={OPENAI_CONCURRENCY})…\n"
-
-                # --- AI parallel uitvoeren ---
-                ai_results: Dict[int, Dict[str, Any]] = {}
-                with ThreadPoolExecutor(max_workers=max(1, OPENAI_CONCURRENCY)) as ex:
-                    futures = {ex.submit(_openai_chat, sys_prompt, j[3], model, OPENAI_TEMP): j for j in jobs}
-                    for fut in as_completed(futures):
-                        pid, title, body_html, _ = futures[fut]
-                        if _cancel_check(job_id):
-                            break
-                        try:
-                            ai_raw = fut.result()
-                            pieces = split_ai_output(ai_raw)
-                            ai_results[pid] = {"pieces": pieces, "title": title, "body": body_html, "error": None}
-                            yield f"      · AI klaar voor #{pid}\n"
-                        except Exception as e:
-                            ai_results[pid] = {"pieces": None, "title": title, "body": body_html, "error": e}
-                            yield f"      · AI fout voor #{pid}: {e}\n"
-
-                # --- Resultaten verwerken + Shopify updaten (defensief, gaat door bij fouten) ---
-                for p in prods:
-                    if _cancel_check(job_id):
-                        yield "⏹ Geannuleerd.\n"
-                        break
-
-                    pid = int(p['id'])
-                    res = ai_results.get(pid)
-                    if not res or res["error"] or not res["pieces"]:
-                        yield f"❌ OpenAI/Shopify-fout bij product #{pid}: {res['error'] if res else 'Geen AI-resultaat'}\n"
+                    # --- AI ---
+                    try:
+                        ai_raw = _openai_chat(sys_prompt, final_prompt, model, OPENAI_TEMP)
+                        pieces = split_ai_output(ai_raw)
+                        yield f"      · AI klaar voor #{pid}\n"
+                    except Exception as e:
+                        yield f"❌ OpenAI-fout bij product #{pid}: {e}\n"
                         continue
 
                     try:
-                        pieces = res["pieces"]
-
                         # Safe strings
-                        title_orig = _s(res["title"])
-                        body_orig  = _s(res["body"])
-                        title_ai   = _s(pieces.get('title')) or title_orig
-                        body_ai    = _s(pieces.get('body_html')) or body_orig
-                        meta_ai_t  = _s(pieces.get('meta_title'))
-                        meta_ai_d  = _s(pieces.get('meta_description'))
+                        title_ai  = _s(pieces.get('title')) or title
+                        body_ai   = _s(pieces.get('body_html')) or body_html
+                        meta_ai_t = _s(pieces.get('meta_title'))
+                        meta_ai_d = _s(pieces.get('meta_description'))
 
                         # Dimensies & pot-info
                         dims = parse_dimensions(title_ai, body_ai)
@@ -893,18 +886,17 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
                         final_meta_title = finalize_meta_title(meta_ai_t, final_title, META_TITLE_LIMIT, BRAND_NAME, META_SUFFIX)
                         final_meta_desc  = finalize_meta_desc(meta_ai_d, final_body, final_title, META_DESC_LIMIT)
 
-                        # Shopify update (sequentieel)
+                        # Shopify update
                         try:
                             update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
                         except Exception as e:
                             yield f"❌ Shopify update fout bij #{pid}: {e}\n"
                             continue
 
-                        # Metafields (mirror naar meerdere definities indien ingesteld)
-                        to_write: Dict[str, str] = {}
+                        # Metafields
+                        to_write = {}
                         if dims.get("height_cm"):        to_write["height_cm"] = dims["height_cm"]
                         if dims.get("pot_diameter_cm"):  to_write["pot_diameter_cm"] = dims["pot_diameter_cm"]
-
                         if to_write:
                             try:
                                 written = set_product_metafields(token, store, pid, to_write)
@@ -935,7 +927,8 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
         finally:
             _cancel_end(job_id)
 
-    return Response(stream(), mimetype="text/plain", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return Response(stream(), mimetype="text/plain",
+                    headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
