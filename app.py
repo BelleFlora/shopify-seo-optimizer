@@ -691,7 +691,6 @@ small{opacity:.85}
 const qs=s=>document.querySelector(s);
 function setLog(t){qs('#status').textContent=t}
 function addLog(t){qs('#status').textContent+='\\n'+t}
-window.addEventListener('DOMContentLoaded',()=>{qs('#txn').checked=[[TXNCHK]];});
 let RUN=false, abortCtrl=null, jobId=null;
 
 async function loadCollections(){
@@ -951,7 +950,7 @@ def dashboard():
             .replace("[[BATCH]]", str(BATCH_SIZE))
             .replace("[[DELAY]]", f"{DELAY_PER_PRODUCT:.1f}")
             .replace("[[TXNUSPS]]", " | ".join(TRANSACTIONAL_CLAIMS))
-            .replace("[[TXNCHK]]", "true" if TRANSACTIONAL_MODE else "false")
+            .replace("[[TXNCHECKED]]", "checked" if TRANSACTIONAL_MODE else "")
             .replace("[[NAMEMAP]]", NAME_MAP_DEFAULT.replace("|", "\n")))
     return Response(html, mimetype="text/html")
 
