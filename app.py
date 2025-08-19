@@ -51,7 +51,7 @@ META_DEBUG_MAPPING = os.environ.get("META_DEBUG_MAPPING", "1").lower() not in ("
 TRANSACTIONAL_MODE = os.environ.get("TRANSACTIONAL_MODE", "0").lower() not in ("0", "false", "no")
 TRANSACTIONAL_CLAIMS = [s.strip() for s in os.environ.get(
     "TRANSACTIONAL_CLAIMS",
-    "Gratis verzending vanaf €49|Vandaag besteld, snel in huis|30 dagen retour|Lokale kweker|Verse kwaliteit"
+    "Gratis verzending vanaf €49 | Binnen 3 werkdagen geleverd |  Soepel retour beleid | Europese kwekers | Top kwaliteit"
 ).split("|") if s.strip()]
 
 # Standaard NL→Latijn koppelingen (UI editable)
