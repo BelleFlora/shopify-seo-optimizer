@@ -695,13 +695,30 @@ let RUN=false, abortCtrl=null, jobId=null;
 
 async function loadCollections(){
   setLog('Collecties laden…');
-  const res=await fetch('/api/collections',{method:'POST',headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({store:qs('#store').value.trim(), token:qs('#token').value.trim()})});
-  const data=await res.json();
-  if(data.error){ setLog('❌ '+data.error); return; }
-  const sel=qs('#collections'); sel.innerHTML='';
-  (data.collections||[]).forEach(c=>{const o=document.createElement('option'); o.value=String(c.id); o.textContent=`${c.title} (#${c.id})`; sel.appendChild(o);});
-  qs('#cstatus').textContent=`${(data.collections||[]).length} collecties geladen`; addLog('Collecties geladen.');
+  try{
+    let res = await fetch('/api/collections', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        store:qs('#store').value.trim(),
+        token:qs('#token').value.trim()
+      })
+    });
+    if(!res.ok){
+      addLog("❌ Fout: "+res.status);
+      return;
+    }
+    let data = await res.json();
+    let sel = qs('#collections'); sel.innerHTML="";
+    data.forEach(c=>{
+      let o=document.createElement('option');
+      o.value=c.id; o.textContent=c.title;
+      sel.appendChild(o);
+    });
+    addLog("✅ "+data.length+" collecties geladen");
+  }catch(e){
+    addLog("❌ Netwerkfout: "+e.message);
+  }
 }
 
 async function optimizeSelected(){
