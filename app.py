@@ -1,252 +1,598 @@
-# app.py
-import os, re, textwrap, time, traceback, secrets
-from typing import Any, Dict, Optional
+# app.py — Belle Flora SEO Optimizer (stabiele sequentiële versie met latere fixes)
+import os, re, json, time, html, textwrap, traceback, secrets
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
+from threading import Lock
+
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, Response, jsonify, redirect, request, session
 
-# Flask setup
+# =========================
+# Config
+# =========================
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(16))
+app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_bytes(32))
 
-# --- Config ---
-OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL     = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_TEMP      = float(os.environ.get("OPENAI_TEMP", "0.7"))
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE", "8"))
-DELAY_PER_PRODUCT= float(os.environ.get("DELAY_SECONDS", "0.5"))
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "michiel")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "CHANGE_ME")
 
-META_TITLE_LIMIT = 60
-META_DESC_LIMIT  = 155
-BRAND_NAME       = "Belle Flora"
-META_SUFFIX      = f"| {BRAND_NAME}"
+SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "your-store.myshopify.com").strip()
 
+OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL     = os.environ.get("DEFAULT_MODEL", "gpt-4o-mini")
+OPENAI_TEMP      = float(os.environ.get("DEFAULT_TEMPERATURE", "0.7"))
+OPENAI_RETRIES   = int(os.environ.get("OPENAI_MAX_RETRIES", "4"))
+
+BATCH_SIZE         = int(os.environ.get("BATCH_SIZE", "8"))
+DELAY_PER_PRODUCT  = float(os.environ.get("DELAY_SECONDS", "0.8"))
+SHOPIFY_RETRIES    = int(os.environ.get("SHOPIFY_MAX_RETRIES", "4"))
+REQUEST_TIMEOUT    = int(os.environ.get("REQUEST_TIMEOUT", "60"))
+
+BRAND_NAME       = os.environ.get("BRAND_NAME", "Belle Flora").strip()
+META_SUFFIX      = f" | {BRAND_NAME}"
+META_TITLE_LIMIT = int(os.environ.get("META_TITLE_LIMIT", "60"))
+META_DESC_LIMIT  = int(os.environ.get("META_DESC_LIMIT", "155"))
+
+# Transactiefocus + vaste USP’s (zoals gevraagd)
 TRANSACTIONAL_MODE = os.environ.get("TRANSACTIONAL_MODE", "true").lower() in ("1","true","yes")
-
-USP_LIST = [
+TRANSACTIONAL_CLAIMS = [
     "Gratis verzending vanaf €49",
     "Binnen 3 werkdagen geleverd",
     "Soepel retourbeleid",
     "Europese kwekers",
     "Top kwaliteit",
 ]
-USP_STR = " | ".join(USP_LIST)
 
-# Heroicons inline (SVG)
-HEROICON_SIZE = int(os.environ.get("HEROICON_SIZE", "20"))
-def heroicon(name:str)->str:
-    paths={
-        "sun":'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4.5v-2.25m0 19.5V19.5m8.485-7.485h2.25m-19.5 0H4.5m12.02-7.515l1.59-1.59m-13.64 13.64l1.59-1.59m0-12.05-1.59-1.59m13.64 13.64-1.59-1.59M12 6.75a5.25 5.25 0 100 10.5 5.25 5.25 0 000-10.5z"/>',
-        "droplet":'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 21a7.5 7.5 0 007.5-7.5c0-2.904-1.718-5.348-3.636-7.485A32.95 32.95 0 0012 3a32.95 32.95 0 00-3.864 3.015C6.218 8.152 4.5 10.596 4.5 13.5A7.5 7.5 0 0012 21z"/>',
-        "home":'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M2.25 12l8.955-8.955c.44-.44 1.15-.44 1.59 0L21.75 12M4.5 9.75V21h15V9.75"/>',
-        "exclamation-triangle":'<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v3.75m0 3.75h.007M2.243 18h19.514c1.322 0 2.082-1.44 1.35-2.571L13.35 3.43c-.66-1.028-2.04-1.028-2.7 0L.893 15.43C.161 16.56.921 18 2.243 18z"/>'
-    }
-    return f'<svg xmlns="http://www.w3.org/2000/svg" width="{HEROICON_SIZE}" height="{HEROICON_SIZE}" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="vertical-align:middle;margin-right:6px;opacity:.9">{paths[name]}</svg>'
-
-ICON_MAP={"licht":heroicon("sun"),"water":heroicon("droplet"),
-          "plaats":heroicon("home"),"giftig":heroicon("exclamation-triangle")}
-
-# Naamkoppeling
+# Naamkoppelingen NL → Latijn (enforce waar relevant)
 NAME_MAP = {
-    "Paradijsvogelplant":"Strelitzia",
-    "Flamingoplant":"Anthurium",
-    "Slaapplant":"Calathea",
-    "Gatenplant":"Monstera",
-    "Olifantsoor":"Alocasia",
-    "Hartbladige klimmer":"Philodendron",
-    "Vrouwentong":"Sanseveria",
-    "Vioolbladplant":"Fycus Lyrata",
-    "Drakenboom":"Dracaena",
-    "ZZ-Plant":"Zamioculcas Zamiifoli",
+    "Paradijsvogelplant": "Strelitzia",
+    "Flamingoplant": "Anthurium",
+    "Slaapplant": "Calathea",
+    "Gatenplant": "Monstera",
+    "Olifantsoor": "Alocasia",
+    "Hartbladige klimmer": "Philodendron",
+    "Vrouwentong": "Sanseveria",
+    "Vioolbladplant": "Ficus lyrata",
+    "Drakenboom": "Dracaena",
+    "ZZ-Plant": "Zamioculcas zamiifolia",
+    # Extra’s uit eerdere lijsten kun je hier toevoegen indien gewenst
 }
 
-# --- Utilities ---
-def _s(x: Any) -> str: return x if isinstance(x, str) else ("" if x is None else str(x))
+# Metafields autodetect/mirroring
+META_NAMESPACE_DEFAULT = os.environ.get("META_NAMESPACE_DEFAULT", "specs")
+META_HEIGHT_HINTS = [s for s in os.environ.get("META_HEIGHT_KEYS_HINT", "hoogte,height").split(",") if s.strip()]
+META_DIAM_HINTS   = [s for s in os.environ.get("META_DIAM_KEYS_HINT", "diameter,pot,ø,⌀").split(",") if s.strip()]
+META_MIRROR_MAX_HEIGHT = int(os.environ.get("META_MIRROR_MAX_HEIGHT", "2"))
+META_MIRROR_MAX_DIAM   = int(os.environ.get("META_MIRROR_MAX_DIAM", "1"))
+META_DEBUG_MAPPING     = os.environ.get("META_DEBUG_MAPPING", "1").lower() not in ("0","false","no")
+
+# Inline heroicons (SVG)
+HEROICON_SIZE = int(os.environ.get("HEROICON_SIZE", "20"))
+
+# =========================
+# Globals
+# =========================
+
+REQ = requests.Session()
+CANCEL_FLAGS: Dict[str, bool] = {}
+CANCEL_LOCK = Lock()
+_META_MAP_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# =========================
+# Utils
+# =========================
+
+def _s(x: Any) -> str:
+    return x if isinstance(x, str) else ("" if x is None else str(x))
+
 def _safe_int_str(x: Any) -> Optional[str]:
     m = re.search(r"(\d{1,3})", _s(x)); return m.group(1) if m else None
 
-# Shopify utils
-def get_collections(store, token):
-    url=f"https://{store}/admin/api/2024-04/custom_collections.json"
-    r=requests.get(url,headers={"X-Shopify-Access-Token":token}); r.raise_for_status()
-    return r.json().get("custom_collections",[])
+def _cancel_start(jid: str) -> None:
+    with CANCEL_LOCK: CANCEL_FLAGS[jid] = False
 
-def get_collection_products(store, token, coll_id):
-    url=f"https://{store}/admin/api/2024-04/collections/{coll_id}/products.json?limit=250"
-    r=requests.get(url,headers={"X-Shopify-Access-Token":token}); r.raise_for_status()
-    return r.json().get("products",[])
+def _cancel_check(jid: str) -> bool:
+    with CANCEL_LOCK: return CANCEL_FLAGS.get(jid, False)
 
-def update_product_texts(store, token, pid, title, body, meta_t, meta_d):
-    url=f"https://{store}/admin/api/2024-04/products/{pid}.json"
-    payload={"product":{"id":pid,"title":title,"body_html":body,
-        "metafields_global_title_tag":meta_t,"metafields_global_description_tag":meta_d}}
-    r=requests.put(url,headers={"X-Shopify-Access-Token":token,"Content-Type":"application/json"},json=payload)
-    r.raise_for_status()
+def _cancel_set(jid: str) -> None:
+    with CANCEL_LOCK:
+        if jid in CANCEL_FLAGS: CANCEL_FLAGS[jid] = True
 
-# AI helpers
-def _openai_chat(sys_prompt,user_prompt,model,temp):
-    import openai; openai.api_key=OPENAI_API_KEY
-    resp=openai.ChatCompletion.create(
-        model=model,temperature=temp,
-        messages=[{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}],
-    )
-    return resp["choices"][0]["message"]["content"]
+def _cancel_end(jid: str) -> None:
+    with CANCEL_LOCK: CANCEL_FLAGS.pop(jid, None)
 
-def split_ai_output(txt:str)->Dict[str,str]:
-    pieces={}
-    m=re.search(r"Nieuwe titel:\s*(.*)",txt,re.I); 
-    if m: pieces["title"]=m.group(1).strip()
-    m=re.search(r"Beschrijving:(.*?)(Meta title:|Meta description:|$)",txt,re.I|re.S)
-    if m: pieces["body_html"]=m.group(1).strip()
-    m=re.search(r"Meta title:\s*(.*)",txt,re.I); 
-    if m: pieces["meta_title"]=m.group(1).strip()
-    m=re.search(r"Meta description:\s*(.*)",txt,re.I); 
-    if m: pieces["meta_description"]=m.group(1).strip()
-    return pieces
+def _shopify_headers(token: str) -> Dict[str, str]:
+    return {"X-Shopify-Access-Token": token, "Content-Type": "application/json", "Accept": "application/json"}
 
-# Dimensions/pot parsing
-def parse_dimensions(title,body):
-    text=f"{title} {body}"
-    h=re.search(r"(\d{1,3})\s*cm",text,re.I)
-    d=re.search(r"[⊘Ø⌀]?\s*(\d{1,3})\s*cm",text,re.I)
-    return {"height_cm": h.group(1) if h else None,"pot_diameter_cm": d.group(1) if d else None}
+def _get(url: str, token: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    for i in range(SHOPIFY_RETRIES):
+        r = REQ.get(url, headers=_shopify_headers(token), params=params or {}, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
+            time.sleep(float(r.headers.get("Retry-After", 2 ** i))); continue
+        r.raise_for_status(); return r
+    r.raise_for_status(); return r
 
-def detect_pot_presence(title,body): return "pot" in (title+body).lower()
+def _post(url: str, token: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
+    for i in range(SHOPIFY_RETRIES):
+        r = REQ.post(url, headers=_shopify_headers(token), json=json_body, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
+            time.sleep(float(r.headers.get("Retry-After", 2 ** i))); continue
+        r.raise_for_status(); return r.json()
+    r.raise_for_status(); return r.json()
 
-# Heroicons inject
-def inject_heroicons(body_html:str)->str:
-    if not body_html: return body_html
-    out=body_html
-    def _inj(label,icon,html):
-        rx=re.compile(rf'(<p[^>]*>\s*)(?:(?:<img[^>]*>|\W|\s)*?)'
-                      rf'(?:(?:<strong>)\s*)?{label}\s*:?(\s*)(.*?)(</p>)',re.I|re.S)
-        def repl(m): return f"{m.group(1)}{icon}<strong>{label}</strong>:{m.group(2)}{m.group(3)}{m.group(4)}"
-        return rx.sub(repl,html)
-    for k,ic in ICON_MAP.items(): out=_inj(k,ic,out)
+def _paged(path: str, token: str, params: Optional[Dict[str, Any]] = None, store: Optional[str] = None) -> List[Dict[str, Any]]:
+    store_domain = store or SHOPIFY_STORE_DOMAIN
+    p = dict(params or {}); p["limit"] = min(int(p.get("limit", 250)), 250)
+    since = 0; out: List[Dict[str, Any]] = []
+    while True:
+        p["since_id"] = since
+        url = f"https://{store_domain}{path}"
+        data = _get(url, token, params=p).json()
+        key = next((k for k in ("custom_collections", "smart_collections", "products", "collects") if k in data), None)
+        if not key: break
+        items = data.get(key, [])
+        if not items: break
+        out.extend(items)
+        since = items[-1]["id"]
+        if len(items) < p["limit"]: break
     return out
 
-# Title/meta helpers
-def enforce_title_name_map(title:str,nmap:Dict[str,str])->str:
-    for nl,lat in nmap.items():
-        if nl.lower() in title.lower() and lat.lower() not in title.lower():
-            return f"{nl} / {lat} " + title
+# =========================
+# OpenAI
+# =========================
+
+def _openai_chat(system_prompt: str, user_prompt: str, model: str = OPENAI_MODEL, temperature: float = OPENAI_TEMP) -> str:
+    if not OPENAI_API_KEY: raise RuntimeError("OPENAI_API_KEY ontbreekt.")
+    url = "https://api.openai.com/v1/chat/completions"
+    body = {"model": model, "temperature": temperature,
+            "messages": [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}]}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    for i in range(OPENAI_RETRIES):
+        try:
+            r = REQ.post(url, headers=headers, json=body, timeout=120)
+            if r.status_code == 429 and i < OPENAI_RETRIES - 1:
+                time.sleep(2 ** i); continue
+            r.raise_for_status(); return r.json()["choices"][0]["message"]["content"]
+        except requests.HTTPError:
+            if r is not None and r.status_code == 429 and i < OPENAI_RETRIES - 1:
+                time.sleep(2 ** i); continue
+            raise RuntimeError(f"OpenAI HTTP {getattr(r,'status_code','?')}: {getattr(r,'text','')}")
+        except Exception as ex:
+            if i < OPENAI_RETRIES - 1: time.sleep(2 ** i); continue
+            raise RuntimeError(f"OpenAI call failed: {ex}")
+
+# =========================
+# Prompts
+# =========================
+
+def _build_system_prompt(txn: bool, usps: List[str], name_map: Dict[str, str]) -> str:
+    nm_lines = "\n".join([f"  • {k} → {v}" for k, v in name_map.items()]) if name_map else ""
+    usps_str = " | ".join(usps) if usps else ""
+    txn_block = ""
+    if txn:
+        txn_block = (
+            "TRANSACTIONELE META-RICHTLIJNEN:\n"
+            f"  • Meta title ≤{META_TITLE_LIMIT}: begin met koopwoord + product; eindig met '| {BRAND_NAME}' als er ruimte is.\n"
+            f"  • Meta description ≤{META_DESC_LIMIT}: voeg 1–2 USP’s toe en een subtiele CTA. USP-lijst: {usps_str}\n\n"
+        )
+    return (
+        "Je bent een ervaren Nederlandstalige SEO-copywriter voor een plantenwebshop (Belle Flora). "
+        "Schrijf natuurlijk, feitelijk en klantgericht; géén emoji.\n\n"
+        "TITELFORMAT (bij voorkeur): [NL-naam] / [Latijn] – ↕[hoogte cm] – ⌀[pot cm]. "
+        "Als er een sierpot bij zit: voeg toe ‘– in [kleur] pot’ of ‘– in pot’ zonder te raden.\n\n"
+        "BESCHRIJVING (HTML):\n"
+        "  <h3>Beschrijving</h3><p>…</p>\n"
+        "  <h3>Eigenschappen & behoeften</h3>\n"
+        "  <p><strong>Lichtbehoefte</strong>: …</p>\n"
+        "  <p><strong>Waterbehoefte</strong>: …</p>\n"
+        "  <p><strong>Standplaats</strong>: …</p>\n"
+        "  <p><strong>Giftigheid</strong>: …</p>\n"
+        "  Alleen simpele HTML (<h3>, <p>, <strong>, <em>); géén <ul>/<li>.\n\n"
+        "SEO:\n"
+        "  Lever een Meta title (≤60) en Meta description (≤155). Iedere tekst uniek.\n\n"
+        f"NAAMCONSISTENTIE (toepassen waar relevant):\n{nm_lines}\n\n"
+        f"{txn_block}"
+        "OUTPUT (exacte labels):\n"
+        "Nieuwe titel: …\n\n"
+        "Beschrijving: … (HTML)\n\n"
+        "Meta title: …\n"
+        "Meta description: …\n"
+    )
+
+# =========================
+# Parsing & normalisatie
+# =========================
+
+RE_CM_RANGE       = re.compile(r"\b(\d{1,3})\s*[-–]\s*(\d{1,3})\s*cm\b", re.I)
+RE_HEIGHT_LABEL   = re.compile(r"(?:↕|hoogte)\s*[:=]?\s*(\d{1,3})\s*cm\b", re.I)
+RE_DIAM_LABEL     = re.compile(r"(?:⌀|Ø|ø|diameter|doorsnede|pot\s*maat|potmaat|pot\s*diameter|potdiameter)\s*[:=]?\s*(\d{1,3})\s*cm?\b", re.I)
+RE_DIAM_SYMBOL    = re.compile(r"[⌀Øø]\s*(\d{1,3})\s*cm?\b", re.I)
+RE_CM_ALL         = re.compile(r"\b(\d{1,3})\s*cm\b", re.I)
+
+COLOR_RE = r"(?:wit|witte|zwart|zwarte|grijs|grijze|antraciet|beige|taupe|terracotta|terra|bruin|bruine|groen|groene|lichtgroen|donkergroen|blauw|blauwe|rood|rode|roze|paars|paarse|geel|gele|oranje|cr[eè]me|goud|gouden|zilver|zilveren|koper|koperen|brons|bronzen)"
+RE_IN_COLOR_POT   = re.compile(r"\bin\s+(?P<color>"+COLOR_RE+r")\s+pot\b", re.I)
+RE_COLOR_POT      = re.compile(r"\b(?P<color>"+COLOR_RE+r")\s+pot\b", re.I)
+RE_POT_COLOR      = re.compile(r"\bpot(?:\s*[:\-]?\s*)(?P<color>"+COLOR_RE+r")\b", re.I)
+
+POT_PRESENCE = [
+    re.compile(r"\bin\s+(?:een\s+)?pot\b", re.I),
+    re.compile(r"\bmet\s+(?:een\s+)?(?:sier)?pot\b", re.I),
+    re.compile(r"\bsierpot\b", re.I),
+    re.compile(r"\bdecor(?:atieve)?\s*pot\b", re.I),
+    re.compile(r"\bcoverpot\b", re.I),
+    re.compile(r"\bcachepot\b", re.I),
+    re.compile(r"\bplanter\b", re.I),
+]
+
+def _html_to_text(s: str) -> str:
+    return re.sub(r"<[^>]+>", " ", s or "", flags=re.I)
+
+def parse_dimensions(title: str, body_html: str) -> Dict[str, str]:
+    text = f"{title or ''}\n{_html_to_text(body_html)}"
+    height = None; diam = None
+    m = RE_HEIGHT_LABEL.search(text)
+    if m: height = int(m.group(1))
+    else:
+        mr = RE_CM_RANGE.search(text)
+        if mr:
+            a, b = int(mr.group(1)), int(mr.group(2)); height = round((a + b) / 2)
+    md = RE_DIAM_LABEL.search(text) or RE_DIAM_SYMBOL.search(text)
+    if md: diam = int(md.group(1))
+    nums = [int(n) for n in RE_CM_ALL.findall(text)]
+    if len(nums) >= 2:
+        hi, lo = max(nums), min(nums)
+        if height is None: height = hi
+        if diam   is None: diam   = lo
+    if diam is not None and height is not None and diam == height and len(set(nums)) >= 2:
+        for v in sorted(set(nums)):
+            if v != height: diam = v; break
+    out: Dict[str, str] = {}
+    if height is not None: out["height_cm"] = str(height)
+    if diam   is not None: out["pot_diameter_cm"] = str(diam)
+    return out
+
+def extract_pot_color(title: str, body_html: str) -> Optional[str]:
+    text = f"{title or ''}\n{_html_to_text(body_html)}"
+    for rx in (RE_IN_COLOR_POT, RE_COLOR_POT, RE_POT_COLOR):
+        m = rx.search(text)
+        if m: return m.group("color").strip()
+    return None
+
+def detect_pot_presence(title: str, body_html: str) -> bool:
+    if extract_pot_color(title, body_html): return True
+    text = f"{title or ''}\n{_html_to_text(body_html)}"
+    return any(rx.search(text) for rx in POT_PRESENCE)
+
+def enforce_title_name_map(title: str, nmap: Dict[str, str]) -> str:
+    """Als NL-naam in titel staat en Latijn ontbreekt, voeg ' / Latijn' in (niet raden; alleen wanneer relevant)."""
+    for nl, lat in nmap.items():
+        if re.search(rf"\b{re.escape(nl)}\b", title, re.I) and not re.search(rf"\b{re.escape(lat)}\b", title, re.I):
+            # Plaatsing: vooraan als “NL / Latijn …”
+            return f"{nl} / {lat} – {title}"
     return title
 
-def normalize_title(title,dims,pot_color,pot_present):
-    t=title
-    if dims.get("height_cm"): t+=f" – ↕{dims['height_cm']}cm"
-    if dims.get("pot_diameter_cm"): t+=f" – ⌀{dims['pot_diameter_cm']}cm"
-    if pot_present: t+=" – in pot"
-    return t
+def normalize_title(title: str, dims: Dict[str, str], pot_color: Optional[str], pot_present: bool) -> str:
+    t = title or ""
+    # cm afdwingen na ↕ / ⌀
+    t = re.sub(r"(↕\s*\d{1,3})(?!\s*cm)\b", r"\1cm", t)
+    t = re.sub(r"([⌀Øø]\s*\d{1,3})(?!\s*cm)\b", r"\1cm", t)
+    # Voeg ontbrekende dimensies bij indien nodig
+    h = dims.get("height_cm"); d = dims.get("pot_diameter_cm")
+    if h and not re.search(r"↕\s*\d{1,3}\s*cm", t): t = (t.strip() + f" – ↕{int(h)}cm").strip()
+    if d and not re.search(r"[⌀Øø]\s*\d{1,3}\s*cm", t): t = (t.strip() + f" – ⌀{int(d)}cm").strip()
+    # pot-suffix (altijd toevoegen als pot aanwezig; zonder kleur niet raden)
+    has_pot_suffix = re.search(r"\bin\s+[^\n]*\bpot\b", t, re.I) is not None
+    if pot_color and not has_pot_suffix: t += f" – in {pot_color} pot"
+    elif pot_present and not has_pot_suffix: t += " – in pot"
+    return t.strip()
 
-def finalize_meta_title(meta_t,fallback_title,limit,brand,suffix):
-    base=_s(meta_t) or fallback_title
-    full=f"{base} {suffix}"
-    if len(full)<=limit: return full
-    keep=limit-len(suffix)-1
-    trunc=full[:keep].rsplit(" ",1)[0]
-    return trunc+" "+suffix
+# ---------- AI output parser & meta finalizers ----------
 
-def finalize_meta_desc(meta_d,body,fallback_title,limit,txn:bool):
-    base=_s(meta_d) or re.sub("<[^>]+>","",body) or fallback_title
-    if txn: base = f"{base}. {USP_STR}"
-    if len(base)<=limit: return base
-    return base[:limit].rsplit(" ",1)[0]
+def split_ai_output(text: str) -> Dict[str, str]:
+    lines = [l.rstrip() for l in (text or "").splitlines()]
+    blob = "\n".join(lines)
+    def find(marks: List[str]) -> str:
+        for m in marks:
+            if m and m.lower() in blob.lower(): return m
+        return ""
+    marks = {
+        "title": find(["Nieuwe titel:", "Titel:", "SEO titel:", "SEO-titel:"]),
+        "body": find(["Beschrijving:", "Body:", "Productbeschrijving:", "Gestandaardiseerde beschrijving:"]),
+        "meta_title": find(["Meta title:", "SEO-meta title:", "Title tag:"]),
+        "meta_desc": find(["Meta description:", "SEO-meta description:", "Description tag:"]),
+    }
+    def extract(start: str, enders: List[str]) -> str:
+        if not start: return ""
+        s = blob.lower().find(start.lower())
+        if s == -1: return ""
+        s += len(start)
+        ends = [blob.lower().find(e.lower(), s) for e in enders if e]; ends = [p for p in ends if p != -1]
+        e = min(ends) if ends else len(blob)
+        return blob[s:e].strip().strip("-: ").strip()
+    title = extract(marks["title"], [marks["body"], marks["meta_title"], marks["meta_desc"]])
+    body  = extract(marks["body"],  [marks["meta_title"], marks["meta_desc"]])
+    meta_title = extract(marks["meta_title"], [marks["meta_desc"]])
+    meta_desc  = extract(marks["meta_desc"],  [])
+    if not any([title, body, meta_title, meta_desc]):
+        parts = [p.strip() for p in re.split(r"\n\s*\n", blob) if p.strip()]
+        title = parts[0] if len(parts) > 0 else ""
+        body  = parts[1] if len(parts) > 1 else ""
+        meta_title = parts[2] if len(parts) > 2 else title
+        meta_desc  = parts[3] if len(parts) > 3 else (body or title)
+    # Body fallback naar vaste structuur zonder emoji; iconen komen server-side
+    if body and not re.search(r"</?(p|h3|strong|em|br)\b", body, flags=re.I):
+        safe = html.escape(body)
+        body = ("<h3>Beschrijving</h3>\n"
+                f"<p>{safe}</p>\n"
+                "<h3>Eigenschappen & behoeften</h3>\n"
+                "<p><strong>Lichtbehoefte</strong>: Onbekend</p>\n"
+                "<p><strong>Waterbehoefte</strong>: Onbekend</p>\n"
+                "<p><strong>Standplaats</strong>: Onbekend</p>\n"
+                "<p><strong>Giftigheid</strong>: Onbekend</p>")
+    return {"title": title, "body_html": body, "meta_title": meta_title, "meta_description": meta_desc}
 
-# --- Flask routes ---
-@app.route("/")
-def dashboard():
-    return DASHBOARD_HTML.replace("[[TXNCHECKED]]","checked" if TRANSACTIONAL_MODE else "")
+_BREAK_RE = re.compile(r"[ \u00A0\u2009\u200A\u200B\u202F\-–—·•,:;]")
 
-@app.route("/api/collections",methods=["POST"])
-def api_collections():
-    data=request.get_json(force=True)
-    return jsonify(get_collections(data["store"],data["token"]))
+def _trim_to_limit(text: str, limit: int) -> str:
+    if len(text) <= limit: return text
+    cut = text[:limit]; m = list(_BREAK_RE.finditer(cut))
+    if m: cut = cut[:m[-1].start()]
+    return cut.rstrip(" -–—·|")
 
-@app.route("/api/optimize",methods=["POST"])
-def api_optimize():
-    data=request.get_json(force=True)
-    store,token,colls=data["store"],data["token"],data["collection_ids"]
-    model=data.get("model",OPENAI_MODEL); user_prompt=data.get("prompt","")
-    txn=data.get("txn",TRANSACTIONAL_MODE); job_id=data.get("job_id","job")
+def finalize_meta_title(raw: str, title_fallback: str, limit: int = META_TITLE_LIMIT,
+                        brand: str = BRAND_NAME, suffix: str = META_SUFFIX) -> str:
+    base = (raw or title_fallback or "").strip()
+    if not base: return (brand if len(brand) <= limit else brand[:limit])
+    # Als suffix al (gedeeltelijk) voorkomt maar afgesneden is (bijv. 'Belle Flor'), verwijder hem eerst
+    partial = re.compile(rf"\s*\|\s*{re.escape(brand[:-1])}[A-Za-z]?\s*$")
+    if not base.endswith(suffix):
+        base = partial.sub("", base)
+    if base.endswith(suffix):
+        if len(base) <= limit: return base
+        prefix = base[:-len(suffix)].rstrip(" -–—|")
+        prefix = _trim_to_limit(prefix, max(0, limit - len(suffix)))
+        return (prefix + suffix)[:limit]
+    else:
+        if f" {brand}" in base or brand in base:
+            return _trim_to_limit(base, limit)
+        if len(base) + len(suffix) <= limit:
+            return base + suffix
+        prefix = _trim_to_limit(base, max(0, limit - len(suffix)))
+        if not prefix: return _trim_to_limit(brand, limit)
+        return (prefix + suffix)[:limit]
 
-    def stream():
-        yield " \n"; yield f"Job: {job_id}\n"
-        for coll in colls:
-            try: prods=get_collection_products(store,token,coll)
-            except Exception as e:
-                yield f"❌ Collectie {coll} fout: {e}\n"; continue
-            yield f"-- Collectie {coll}: {len(prods)} producten --\n"
-            for p in prods:
-                pid=int(p["id"]); title=_s(p["title"]); body=_s(p.get("body_html",""))
-                base_prompt=f"Originele titel: {title}\nOriginele beschrijving: {body}\nTaken: verbeter teksten..."
-                try: ai_raw=_openai_chat("Je bent een SEO copywriter",base_prompt,model,OPENAI_TEMP); pieces=split_ai_output(ai_raw)
-                except Exception as e: yield f"❌ OpenAI fout {pid}: {e}\n"; continue
-                try:
-                    title_ai=enforce_title_name_map(_s(pieces.get("title")) or title,NAME_MAP)
-                    body_ai=_s(pieces.get("body_html")) or body
-                    dims=parse_dimensions(title_ai,body_ai); pot_present=detect_pot_presence(title_ai,body_ai)
-                    final_title=normalize_title(title_ai,dims,None,pot_present)
-                    final_body=inject_heroicons(body_ai)
-                    final_meta_title=finalize_meta_title(pieces.get("meta_title"),final_title,META_TITLE_LIMIT,BRAND_NAME,META_SUFFIX)
-                    final_meta_desc=finalize_meta_desc(pieces.get("meta_description"),final_body,final_title,META_DESC_LIMIT,txn)
-                    update_product_texts(store,token,pid,final_title,final_body,final_meta_title,final_meta_desc)
-                    yield f"✅ {pid} bijgewerkt: {final_title}\n"
-                except Exception as e: yield f"❌ Product {pid} fout: {e}\n"
-                time.sleep(DELAY_PER_PRODUCT)
-            yield f"-- Collectie {coll} klaar --\n"
-    return Response(stream(),mimetype="text/plain",headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+def finalize_meta_desc(raw: str, body_fallback: str, title_fallback: str, limit: int = META_DESC_LIMIT,
+                       txn: bool = TRANSACTIONAL_MODE, usps: Optional[List[str]] = None) -> str:
+    text = (raw or body_fallback or title_fallback or "").strip()
+    if txn:
+        usps = usps or TRANSACTIONAL_CLAIMS
+        add = " | ".join(usps[:2])  # 1–2 USP’s kort erbij
+        if add and add not in text:
+            text = f"{text}. {add}"
+    if len(text) <= limit: return text
+    return _trim_to_limit(text, limit)
 
-# --- HTML Dashboard ---
-DASHBOARD_HTML="""
-<!doctype html><html><head><meta charset=utf-8>
-<title>SEO Optimizer</title></head>
-<body>
-<h1>Belle Flora Optimizer</h1>
-<div>
-  <label>Store <input id=store></label>
-  <label>Token <input id=token></label>
-  <button onclick="loadCollections()">Collecties laden</button>
-</div>
-<select id=collections multiple size=6 style="width:300px"></select>
-<div>
-  <label><input type="checkbox" id="txn" [[TXNCHECKED]]> Transactiefocus</label>
-</div>
-<button id=btnRun onclick="optimizeSelected()">Optimaliseer</button>
-<button id=btnCancel onclick="cancelJob()" disabled>Annuleer</button>
-<pre id=log>Klaar om te starten…</pre>
-<script>
-function qs(s){return document.querySelector(s);}
-function setLog(t){qs('#log').textContent=t;}
-function addLog(t){qs('#log').textContent+="\\n"+t;}
-window.onerror=function(msg,src,line,col,err){addLog("❌ JS-fout: "+msg+" @"+line+":"+col);};
-async function loadCollections(){
-  setLog("Collecties laden…");
-  try{
-    let res=await fetch('/api/collections',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({store:qs('#store').value.trim(),token:qs('#token').value.trim()})});
-    if(!res.ok){addLog("❌ Fout "+res.status);return;}
-    let data=await res.json();
-    let sel=qs('#collections'); sel.innerHTML="";
-    data.forEach(c=>{let o=document.createElement('option');o.value=c.id;o.textContent=c.title;sel.appendChild(o);});
-    addLog("✅ "+data.length+" collecties geladen");
-  }catch(e){addLog("❌ Netwerkfout "+e.message);}
-}
-let abortCtrl=null, RUN=false;
-async function optimizeSelected(){
-  if(RUN) return; RUN=true; abortCtrl=new AbortController();
-  setLog("Start optimalisatie…");
-  let ids=Array.from(qs('#collections').selectedOptions).map(o=>o.value);
-  let res=await fetch('/api/optimize',{method:'POST',signal:abortCtrl.signal,headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({store:qs('#store').value.trim(),token:qs('#token').value.trim(),collection_ids:ids,txn:qs('#txn').checked})});
-  if(!res.ok){addLog("❌ "+res.status);RUN=false;return;}
-  let reader=res.body.getReader(); let dec=new TextDecoder();
-  while(true){let {value,done}=await reader.read(); if(done)break; addLog(dec.decode(value));}
-  RUN=false;
-}
-function cancelJob(){if(abortCtrl){abortCtrl.abort();addLog("⏹ Job geannuleerd.");}}
-</script>
-</body></html>
-"""
+# ---------- Inline SVG heroicons ----------
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",5000)))
+def _svg_attrs(name: str) -> str:
+    return (f'class="bf-icon" data-heroicon="{name}" '
+            f'width="{HEROICON_SIZE}" height="{HEROICON_SIZE}" viewBox="0 0 24 24" '
+            'fill="none" stroke="currentColor" stroke-width="1.5" '
+            'stroke-linecap="round" stroke-linejoin="round" '
+            'style="vertical-align:text-bottom;margin-right:6px;opacity:.95"')
+
+def _icon_svg(name: str) -> str:
+    if name == "sun":
+        return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
+  <circle cx="12" cy="12" r="4"></circle>
+  <line x1="12" y1="2" x2="12" y2="5"></line>
+  <line x1="12" y1="19" x2="12" y2="22"></line>
+  <line x1="2" y1="12" x2="5" y2="12"></line>
+  <line x1="19" y1="12" x2="22" y2="12"></line>
+  <line x1="4.22" y1="4.22" x2="6.34" y2="6.34"></line>
+  <line x1="17.66" y1="17.66" x2="19.78" y2="19.78"></line>
+  <line x1="17.66" y1="6.34" x2="19.78" y2="4.22"></line>
+  <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"></line>
+</svg>'''
+    if name == "droplet":  # Water
+        return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
+  <path d="M12 2.5c-3 3.2-6.5 7.1-6.5 10.5a6.5 6.5 0 1 0 13 0c0-3.4-3.5-7.3-6.5-10.5z"></path>
+</svg>'''
+    if name == "home":
+        return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
+  <path d="M3 11.5l9-7 9 7"></path>
+  <path d="M5.5 10.5V20a1.5 1.5 0 0 0 1.5 1.5H9.5V15h5v6.5H17A1.5 1.5 0 0 0 18.5 20V10.5"></path>
+</svg>'''
+    if name == "exclamation-triangle":
+        return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
+  <path d="M10.3 3.6L2.6 17.1a1.5 1.5 0 0 0 1.3 2.2h16.2a1.5 1.5 0 0 0 1.3-2.2L13.7 3.6a1.5 1.5 0 0 0-3.4 0z"></path>
+  <line x1="12" y1="8" x2="12" y2="13"></line>
+  <circle cx="12" cy="16.5" r="1"></circle>
+</svg>'''
+    return _icon_svg("droplet")
+
+def inject_heroicons(body_html: str) -> str:
+    if not body_html: return body_html
+    if 'class="bf-icon"' in body_html or 'data-heroicon=' in body_html:
+        return body_html
+    out = body_html
+    def _inject(label: str, icon_html: str, html: str) -> str:
+        rx = re.compile(
+            rf'(<p[^>]*>\s*)'
+            rf'(?:<img[^>]*>\s*|<svg[^>]*>\s*</svg>\s*|[\u2600-\u27BF\u1F300-\u1FAFF\s]*?)*'
+            rf'(?:(?:<strong>)\s*)?{label}\s*(?::)?\s*(?:</strong>)?\s*(.*?)(</p>)',
+            re.I | re.S
+        )
+        def repl(m):
+            pre, rest, end = m.group(1), m.group(2), m.group(3)
+            return f'{pre}{icon_html}<strong>{label}</strong>: {rest}{end}'
+        return rx.sub(repl, html)
+    out = _inject("Lichtbehoefte", _icon_svg("sun"), out)
+    out = _inject("Waterbehoefte", _icon_svg("droplet"), out)
+    out = _inject("Standplaats",   _icon_svg("home"), out)
+    out = _inject("Giftigheid",    _icon_svg("exclamation-triangle"), out)
+    return out
+
+# =========================
+# Shopify GraphQL helpers (teksten + metafields)
+# =========================
+
+def _gql_url(store_domain: str) -> str:
+    return f"https://{store_domain}/admin/api/2025-01/graphql.json"
+
+def update_product_texts(store_domain: str, token: str, product_id: int,
+                         new_title: str, new_body_html: str, seo_title: str, seo_desc: str) -> None:
+    mutation = """
+    mutation productSeoAndDesc($input: ProductInput!) {
+      productUpdate(input: $input) {
+        product { id }
+        userErrors { field message }
+      }
+    }"""
+    gid = f"gid://shopify/Product/{int(product_id)}"
+    variables = {"input": {"id": gid, "title": new_title, "descriptionHtml": new_body_html,
+                           "seo": {"title": seo_title or new_title, "description": seo_desc or ""}}}
+    data = _post(_gql_url(store_domain), token, {"query": mutation, "variables": variables})
+    errs = (data.get("data", {}).get("productUpdate", {}) or {}).get("userErrors", [])
+    if errs: raise RuntimeError(f"Shopify productUpdate: {errs}")
+
+def _defs_for_product(token: str, store_domain: str) -> List[Dict[str, Any]]:
+    query = """
+    query defs {
+      metafieldDefinitions(ownerType: PRODUCT, first: 250) {
+        edges { node { name namespace key type { name } } }
+      }
+    }"""
+    data = _post(_gql_url(store_domain), token, {"query": query})
+    edges = (((data or {}).get("data") or {}).get("metafieldDefinitions") or {}).get("edges") or []
+    return [e["node"] for e in edges if "node" in e]
+
+def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    hints = [h.lower().strip() for h in hints]
+    for d in defs:
+        name = (d.get("name") or ""); key = (d.get("key") or ""); ns = (d.get("namespace") or "")
+        lname, lkey = name.lower(), key.lower()
+        if not any(h in lname or h in lkey for h in hints): continue
+        tname = (((d.get("type") or {}).get("name")) or "single_line_text_field").lower()
+        score = 0
+        if "number_integer" in tname: score += 30
+        elif "dimension" in tname:    score += 22
+        elif "number_decimal" in tname: score += 18
+        elif "single_line_text_field" in tname: score += 10
+        if lkey in ("hoogte_cm", "hoogte"): score += 50
+        if lkey in ("diameter_cm", "pot_diameter_cm", "diameter"): score += 50
+        if ns.lower() == "custom": score += 2
+        out.append({"namespace": ns, "key": key, "name": name,
+                    "type": (d.get("type") or {}).get("name") or "single_line_text_field",
+                    "score": score})
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
+
+def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
+    cache_key = store_domain
+    if cache_key in _META_MAP_CACHE: return _META_MAP_CACHE[cache_key]
+    defs = _defs_for_product(token, store_domain)
+    h = _rank_candidates(defs, META_HEIGHT_HINTS or ["hoogte", "height"])
+    d = _rank_candidates(defs, META_DIAM_HINTS  or ["diameter", "pot", "ø", "⌀"])
+    if not h: h = [{"namespace": META_NAMESPACE_DEFAULT, "key": "height_cm", "name": "height_cm", "type": "single_line_text_field", "score": 0}]
+    if not d: d = [{"namespace": META_NAMESPACE_DEFAULT, "key": "pot_diameter_cm", "name": "pot_diameter_cm", "type": "single_line_text_field", "score": 0}]
+    mm = {"height_candidates": h, "diam_candidates": d,
+          "height_ns": h[0]["namespace"], "height_key": h[0]["key"], "height_type": h[0]["type"],
+          "diam_ns": d[0]["namespace"], "diam_key": d[0]["key"], "diam_type": d[0]["type"]}
+    _META_MAP_CACHE[cache_key] = mm; return mm
+
+def _encode_value(val_str: str, tname: str) -> str:
+    t = (tname or "").lower()
+    try:
+        if t == "number_integer": return str(int(val_str))
+        if t == "number_decimal": return str(float(val_str))
+        if t == "dimension":      return json.dumps({"value": float(val_str), "unit": "cm"})
+    except Exception:
+        pass
+    return str(val_str)
+
+def _set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname: str, value: str) -> Tuple[bool, str]:
+    mutation = """
+    mutation setOne($metafields: [MetafieldsSetInput!]!] {
+      metafieldsSet(metafields: $metafields) {
+        metafields { namespace key type value }
+        userErrors { field message }
+      }
+    }"""
+    payload = {"query": mutation, "variables": {"metafields": [{
+        "ownerId": gid, "namespace": ns, "key": key, "type": tname, "value": _encode_value(value, tname)
+    }]}}
+    data = _post(_gql_url(store_domain), token, payload)
+    ue = (data.get("data", {}).get("metafieldsSet", {}) or {}).get("userErrors", [])
+    if ue: return False, (ue[0].get("message") or str(ue))
+    return True, ""
+
+def set_product_metafields(token: str, store_domain: str, product_id: int, values: Dict[str, str]) -> Dict[str, List[str]]:
+    if not values: return {"height": [], "diam": []}
+    mm = _ensure_meta_map(token, store_domain)
+    gid = f"gid://shopify/Product/{int(product_id)}"
+    written = {"height": [], "diam": []}
+    if values.get("height_cm"):
+        left = META_MIRROR_MAX_HEIGHT
+        for cand in mm["height_candidates"]:
+            ok, msg = _set_one(token, store_domain, gid, cand["namespace"], cand["key"], cand["type"], values["height_cm"])
+            if ok:
+                written["height"].append(f"{cand['namespace']}.{cand['key']} [{cand['type']}]"); left -= 1
+                if left <= 0: break
+            elif "Owner subtype does not match" in msg:
+                continue
+            else:
+                raise RuntimeError(f"metafieldsSet (hoogte): {msg}")
+    if values.get("pot_diameter_cm"):
+        left = META_MIRROR_MAX_DIAM
+        for cand in mm["diam_candidates"]:
+            ok, msg = _set_one(token, store_domain, gid, cand["namespace"], cand["key"], cand["type"], values["pot_diameter_cm"])
+            if ok:
+                written["diam"].append(f"{cand['namespace']}.{cand['key']} [{cand['type']}]"); left -= 1
+                if left <= 0: break
+            elif "Owner subtype does not match" in msg:
+                continue
+            else:
+                raise RuntimeError(f"metafieldsSet (diameter): {msg}")
+    return written
+
+# =========================
+# Auth & UI
+# =========================
+
+def _require_login(fn):
+    def wrapper(*args, **kwargs):
+        if not session.get("logged_in"): return redirect("/login")
+        return fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__; return wrapper
+
+LOGIN_HTML = """<!doctype html><html lang="nl"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Inloggen – Belle Flora</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b1020;color:#eef;margin:0}
+.card{max-width:820px;margin:48px auto;background:#121735;padding:24px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+h1{margin:0 0 12px 0}label{display:block;margin:12px 0 8px}
+input{width:100%;padding:12px;border-radius:10px;border:1px solid #2a335a;background:#0f1430;color:#eef}
+button{padding:12px 16px;border:0;border-radius:12px;background:#4f7dff;color:#fff;font-weight:600;cursor:pointer;margin-top:12px}
+</style></head><body>
+<div class="card">
+  <h1>Inloggen</h1>
+  <form method="post" action="/login">
+    <label>Gebruikersnaam</label><input name="username" required />
+    <label>Wachtwoord</label><input name="password" type="password" required />
+    <button>Inloggen</button>
+  </form>
+</div></body></html>"""
+
+DASHBOARD_HTML = """<!doctype html><html lang="nl"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Belle Flora SEO Optimizer</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0b1020;color:#eef;margin:0}
+.wrap{max-width:1100px;margin:28px auto;padding:0 16px}
+.card{background:#121735;padding:20px;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);margin-bottom:16px}
+label{display:block;margin:10px 0 6px}
+input,textarea,select{width:100%;padding:12px;border-radius:10px;border
