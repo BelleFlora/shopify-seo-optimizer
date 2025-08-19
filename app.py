@@ -1,4 +1,4 @@
-# app.py — Belle Flora SEO Optimizer (stabiel, sequentieel, met alle fixes)
+# app.py — Belle Flora SEO Optimizer (stabiel, sequentieel, met error-handling voor collecties)
 import os, re, json, time, html, secrets
 from typing import Any, Dict, List, Optional, Tuple
 from threading import Lock
@@ -60,7 +60,7 @@ NAME_MAP = {
 META_NAMESPACE_DEFAULT = os.environ.get("META_NAMESPACE_DEFAULT", "specs")
 META_HEIGHT_HINTS = [s for s in os.environ.get("META_HEIGHT_KEYS_HINT", "hoogte,height").split(",") if s.strip()]
 META_DIAM_HINTS   = [s for s in os.environ.get("META_DIAM_KEYS_HINT", "diameter,pot,ø,⌀").split(",") if s.strip()]
-META_MIRROR_MAX_HEIGHT = int(os.environ.get("META_MIRROR_MAX_HEIGHT", "2"))  # bijv. “Hoogte (cm)” én “Hoogte”
+META_MIRROR_MAX_HEIGHT = int(os.environ.get("META_MIRROR_MAX_HEIGHT", "2"))
 META_MIRROR_MAX_DIAM   = int(os.environ.get("META_MIRROR_MAX_DIAM", "1"))
 
 # Inline heroicons (SVG)
@@ -85,10 +85,15 @@ def _s(x: Any) -> str:
 def _trim_word_boundary(text: str, limit: int) -> str:
     if len(text) <= limit: return text
     cut = text[:limit]
-    # breek op laatste spatie/streepje/pipe etc.
     m = list(re.finditer(r"[ \u00A0\u2009\u200A\u200B\u202F\-–—·•,:;|]", cut))
     if m: cut = cut[:m[-1].start()]
     return cut.rstrip(" -–—·|")
+
+def _normalize_store_domain(raw: str) -> str:
+    s = (raw or "").strip()
+    s = re.sub(r"^https?://", "", s, flags=re.I)
+    s = s.split("/")[0]
+    return s
 
 def _shopify_headers(token: str) -> Dict[str, str]:
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json", "Accept": "application/json"}
@@ -150,7 +155,7 @@ def _build_system_prompt(txn: bool) -> str:
     )
 
 def _openai_chat(sys_prompt: str, user_prompt: str) -> str:
-    if not OPENAI_API_KEY: raise RuntimeError("OPENAI_API_KEY ontbreekt.")
+    if not OPENAI_API_KEY: raise RuntimeError("OPENAI_KEY ontbreekt.")
     url = "https://api.openai.com/v1/chat/completions"
     body = {"model": OPENAI_MODEL, "temperature": OPENAI_TEMP,
             "messages": [{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}]}
@@ -195,7 +200,6 @@ def split_ai_output(text: str) -> Dict[str, str]:
         body  = parts[1] if len(parts) > 1 else ""
         meta_title = parts[2] if len(parts) > 2 else title
         meta_desc  = parts[3] if len(parts) > 3 else (body or title)
-    # Body fallback naar vaste structuur zonder emoji; iconen komen server-side
     if body and not re.search(r"</?(p|h3|strong|em|br)\b", body, flags=re.I):
         safe = html.escape(body)
         body = ("<h3>Beschrijving</h3>\n"
@@ -272,7 +276,6 @@ def detect_pot_presence(title: str, body_html: str) -> bool:
     return any(rx.search(text) for rx in POT_PRESENCE)
 
 def enforce_title_name_map(title: str) -> str:
-    """Als NL-naam aanwezig en Latijn ontbreekt: voeg ‘NL / Latijn – ’ vóór de titel (niet raden)."""
     for nl, lat in NAME_MAP.items():
         if re.search(rf"\b{re.escape(nl)}\b", title, re.I) and not re.search(rf"\b{re.escape(lat)}\b", title, re.I):
             return f"{nl} / {lat} – {title}"
@@ -280,14 +283,11 @@ def enforce_title_name_map(title: str) -> str:
 
 def normalize_title(title: str, dims: Dict[str, str], pot_color: Optional[str], pot_present: bool) -> str:
     t = title or ""
-    # Zorg dat ↕/⌀ eindigen op cm
     t = re.sub(r"(↕\s*\d{1,3})(?!\s*cm)\b", r"\1cm", t)
     t = re.sub(r"([⌀Øø]\s*\d{1,3})(?!\s*cm)\b", r"\1cm", t)
-    # Vul ontbrekende dimensies uit parsing aan
     h = dims.get("height_cm"); d = dims.get("pot_diameter_cm")
     if h and not re.search(r"↕\s*\d{1,3}\s*cm", t): t = (t.strip() + f" – ↕{int(h)}cm").strip()
     if d and not re.search(r"[⌀Øø]\s*\d{1,3}\s*cm", t): t = (t.strip() + f" – ⌀{int(d)}cm").strip()
-    # Pot-suffix (altijd bij aanwezigheid; kleur alleen als expliciet gevonden)
     has_pot_suffix = re.search(r"\bin\s+[^\n]*\bpot\b", t, re.I) is not None
     if pot_color and not has_pot_suffix: t += f" – in {pot_color} pot"
     elif pot_present and not has_pot_suffix: t += " – in pot"
@@ -297,8 +297,6 @@ def finalize_meta_title(raw: str, title_fallback: str) -> str:
     base = (raw or title_fallback or "").strip()
     if not base:
         return BRAND_NAME[:META_TITLE_LIMIT]
-    # Als suffix (merk) al staat of gedeeltelijk afgekapt is, normaliseer:
-    # verwijder eventueel een afgekapt merk aan het eind (bv. "Belle Flor")
     base = re.sub(rf"\s*\|\s*{re.escape(BRAND_NAME[:-1])}[A-Za-z]?$", "", base).rstrip()
     full = base + META_SUFFIX
     if len(full) <= META_TITLE_LIMIT:
@@ -312,7 +310,6 @@ def finalize_meta_title(raw: str, title_fallback: str) -> str:
 def finalize_meta_desc(raw: str, body_fallback: str, title_fallback: str, txn: bool) -> str:
     text = (raw or re.sub(r"<[^>]+>", " ", body_fallback or "") or title_fallback or "").strip()
     if txn:
-        # voeg kort 1–2 USP’s toe
         add = " | ".join(TRANSACTIONAL_CLAIMS[:2])
         if add and add not in text:
             text = f"{text}. {add}"
@@ -364,7 +361,7 @@ def inject_heroicons(body_html: str) -> str:
     if 'class="bf-icon"' in body_html or 'data-heroicon=' in body_html:
         return body_html
     out = body_html
-    def _inject(label: str, icon_html: str, html_: str) -> str:
+    def _inject(label: str, icon_html: str, html_) -> str:
         rx = re.compile(
             rf'(<p[^>]*>\s*)'
             rf'(?:<img[^>]*>\s*|<svg[^>]*>\s*</svg>\s*|[\u2600-\u27BF\u1F300-\u1FAFF\s]*?)*'
@@ -397,7 +394,7 @@ def update_product_texts(store_domain: str, token: str, product_id: int,
     gid = f"gid://shopify/Product/{int(product_id)}"
     variables = {"input": {"id": gid, "title": new_title, "descriptionHtml": new_body_html,
                            "seo": {"title": seo_title or new_title, "description": seo_desc or ""}}}
-    data = _post(_gql_url(SHOPIFY_STORE_DOMAIN), token, {"query": mutation, "variables": variables})
+    data = _post(_gql_url(store_domain), token, {"query": mutation, "variables": variables})
     errs = (data.get("data", {}).get("productUpdate", {}) or {}).get("userErrors", [])
     if errs: raise RuntimeError(f"Shopify productUpdate: {errs}")
 
@@ -585,8 +582,11 @@ async function loadCollections(){
   try{
     let res=await fetch('/api/collections',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({store:qs('#store').value.trim(),token:qs('#token').value.trim()})});
-    if(!res.ok){addLog('❌ Fout '+res.status);return;}
-    let data=await res.json();
+    let data=await res.json().catch(()=>null);
+    if(!res.ok){
+      addLog('❌ '+(data&&data.error ? data.error : ('Fout '+res.status)));
+      return;
+    }
     const sel=qs('#collections'); sel.innerHTML='';
     (data||[]).forEach(c=>{const o=document.createElement('option');o.value=String(c.id);o.textContent=c.title;sel.appendChild(o);});
     qs('#cstatus').textContent=`${(data||[]).length} collecties geladen`;
@@ -629,40 +629,67 @@ def dashboard():
 
 @app.route("/api/collections", methods=["POST"])
 def api_collections():
-    if not session.get("logged_in"): return Response("Unauthorized", status=401)
-    data=request.get_json(force=True)
-    store=(data.get("store") or SHOPIFY_STORE_DOMAIN).strip()
-    token=(data.get("token") or "").strip()
-    if not token: return jsonify([])
-    # REST custom + smart
-    customs = _paged("/admin/api/2024-07/custom_collections.json", token, store=store)
-    smarts  = _paged("/admin/api/2024-07/smart_collections.json", token, store=store)
-    cols = [{"id": c["id"], "title": c.get("title","(zonder titel)")} for c in (customs+smarts)]
-    return jsonify(cols)
+    if not session.get("logged_in"):
+        return Response("Unauthorized", status=401)
+    try:
+        data = request.get_json(force=True) or {}
+        store = _normalize_store_domain(data.get("store") or SHOPIFY_STORE_DOMAIN)
+        token = (data.get("token") or "").strip()
+        if not token:
+            return jsonify({"error": "Geen Shopify token meegegeven."}), 400
+
+        customs = _paged("/admin/api/2024-07/custom_collections.json", token, store=store)
+        smarts  = _paged("/admin/api/2024-07/smart_collections.json",  token, store=store)
+        cols = [{"id": c["id"], "title": c.get("title","(zonder titel)")} for c in (customs+smarts)]
+        return jsonify(cols)
+
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", 502)
+        text = ""
+        try: text = e.response.text
+        except Exception: text = str(e)
+        return jsonify({"error": f"Shopify HTTP {code}: {text}"}), code
+    except Exception as e:
+        return jsonify({"error": f"Collecties laden mislukt: {e}"}), 400
+
+def _paged(path: str, token: str, params: Optional[Dict[str, Any]] = None, store: Optional[str] = None) -> List[Dict[str, Any]]:
+    store_domain = store or SHOPIFY_STORE_DOMAIN
+    p = dict(params or {}); p["limit"] = min(int(p.get("limit", 250)), 250)
+    since = 0; out: List[Dict[str, Any]] = []
+    while True:
+        p["since_id"] = since
+        url = f"https://{store_domain}{path}"
+        data = _get(url, token, params=p).json()
+        key = next((k for k in ("custom_collections", "smart_collections", "products", "collects") if k in data), None)
+        if not key: break
+        items = data.get(key, [])
+        if not items: break
+        out.extend(items)
+        since = items[-1]["id"]
+        if len(items) < p["limit"]: break
+    return out
 
 @app.route("/api/optimize", methods=["POST"])
 def api_optimize():
     if not session.get("logged_in"): return Response("Unauthorized", status=401)
     payload = request.get_json(force=True)
-    store = (payload.get("store") or SHOPIFY_STORE_DOMAIN).strip()
+    store = _normalize_store_domain((payload.get("store") or SHOPIFY_STORE_DOMAIN).strip())
     token = (payload.get("token") or "").strip()
     txn   = bool(payload.get("txn", TRANSACTIONAL_MODE))
     colls = payload.get("collection_ids") or []
     if not token: return Response("Shopify token ontbreekt.\n", mimetype="text/plain", status=400)
-    if not OPENAI_API_KEY: return Response("OPENAI_API_KEY ontbreekt in de server-omgeving.\n", mimetype="text/plain", status=500)
+    if not OPENAI_API_KEY: return Response("OPENAI_API_KEY ontbreekt.\n", mimetype="text/plain", status=500)
 
     sys_prompt = _build_system_prompt(txn)
 
     def stream():
         try:
             for coll_id in colls:
-                # producten ophalen
                 url=f"https://{store}/admin/api/2024-07/collects.json"
                 collects=_get(url, token, params={"collection_id":coll_id,"limit":250}).json().get("collects",[])
                 pids=[int(c["product_id"]) for c in collects]
                 yield f"Collectie {coll_id}: {len(pids)} producten gevonden\n"
 
-                # batchgewijs details
                 for i in range(0, len(pids), 50):
                     batch=pids[i:i+50]
                     r=_get(f"https://{store}/admin/api/2024-07/products.json", token, params={"ids":",".join(map(str,batch)),"limit":250})
@@ -677,13 +704,11 @@ def api_optimize():
                                      "1) Lever ‘Nieuwe titel’ volgens format.\n"
                                      "2) Lever ‘Beschrijving’ (HTML) met vaste h3-secties en 4 regels.\n"
                                      "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n")
-
                         try:
                             yield f"→ #{pid}: AI-tekst genereren...\n"
                             ai_raw=_openai_chat(sys_prompt, base_prompt)
                             pieces=split_ai_output(ai_raw)
 
-                            # titel/body normaliseren
                             title_ai=enforce_title_name_map(_s(pieces.get("title")) or title)
                             body_ai=_s(pieces.get("body_html")) or body
 
@@ -697,10 +722,8 @@ def api_optimize():
                             final_meta_title=finalize_meta_title(pieces.get("meta_title"), final_title)
                             final_meta_desc =finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
 
-                            # Shopify update teksten
                             update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
 
-                            # Metafields aanvullen (auto-detect & mirror)
                             missing={}
                             if dims.get("height_cm"):       missing["height_cm"]=dims["height_cm"]
                             if dims.get("pot_diameter_cm"): missing["pot_diameter_cm"]=dims["pot_diameter_cm"]
