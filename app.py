@@ -1,11 +1,17 @@
 # app.py
-# Belle Flora SEO Optimizer – snel & stabiel
-# Nieuw:
-# • Inline SVG iconen (heroicons-stijl): geen CDN, water-icoon altijd zichtbaar.
-# • Parallelle OpenAI-calls per batch (OPENAI_CONCURRENCY), Shopify-updates sequentieel.
-# • Alle bestaande features behouden (annuleren, transactiefocus, naamkoppelingen, metafields autodetect+mirror, cm-fixes, “– in pot”, streaming).
+# Belle Flora SEO Optimizer – snel, robuust, en met inline heroicons.
+# - Parallelle OpenAI-calls (instelbaar via OPENAI_CONCURRENCY)
+# - Shopify updates sequentieel (veilig tegen rate-limits)
+# - Inline SVG iconen (zon, druppel, huis, waarschuwing) – geen CDN nodig
+# - Robuust: productfouten stoppen de job niet; batches lopen door
+# - Annuleren, transactiefocus, naamkoppelingen, pot-suffix, cm-fixes
+#
+# Env tips:
+#   OPENAI_CONCURRENCY=3..5
+#   DELAY_SECONDS=0.4 (of 0)
+#   HEROICON_SIZE=20..24
 
-import os, re, json, time, html, textwrap
+import os, re, json, time, html, textwrap, traceback
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 from threading import Lock
@@ -35,8 +41,6 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 DELAY_PER_PRODUCT = float(os.environ.get("DELAY_SECONDS", "2.5"))
 SHOPIFY_RETRIES = int(os.environ.get("SHOPIFY_MAX_RETRIES", "4"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "60"))
-
-HEROICON_SIZE = int(os.environ.get("HEROICON_SIZE", "20"))  # px; maat voor inline heroicons
 
 # Merknaam / meta-suffix
 BRAND_NAME = os.environ.get("BRAND_NAME", "Belle Flora").strip()
@@ -81,6 +85,9 @@ NAME_MAP_DEFAULT = os.environ.get(
     "parapluplant=Schefflera arboricola|vingerplant=Fatsia japonica|kameraralia=Polyscias scutellaria|clusia=Clusia rosea|"
     "stromanthe=Stromanthe sanguinea|aloë vera=Aloe barbadensis"
 )
+
+# Inline heroicons grootte (px)
+HEROICON_SIZE = int(os.environ.get("HEROICON_SIZE", "20"))
 
 # =========================
 # Globals
@@ -147,6 +154,15 @@ def _paged(path: str, token: str, params: Optional[Dict[str, Any]] = None, store
         since = items[-1]["id"]
         if len(items) < p["limit"]: break
     return out
+
+def _s(x: Any) -> str:
+    """Safe str: None -> '', anders str(x)."""
+    return x if isinstance(x, str) else ("" if x is None else str(x))
+
+def _safe_int_str(x: Any) -> Optional[str]:
+    """Pak eerste getal (1–3 digits) uit een string; retourneer 'nn' of None."""
+    m = re.search(r"(\d{1,3})", _s(x))
+    return m.group(1) if m else None
 
 # =========================
 # OpenAI
@@ -403,7 +419,7 @@ def _svg_attrs(name: str) -> str:
             'style="vertical-align:text-bottom;margin-right:6px;opacity:.95"')
 
 def _icon_svg(name: str) -> str:
-    # Simpele, nette paths (visueel gelijkend aan heroicons)
+    # Simpele paths (lichter dan echte heroicons, maar stijl gelijkend)
     if name == "sun":
         return f'''<svg {_svg_attrs(name)}>
   <circle cx="12" cy="12" r="4"></circle>
@@ -431,7 +447,6 @@ def _icon_svg(name: str) -> str:
   <line x1="12" y1="8" x2="12" y2="13"></line>
   <circle cx="12" cy="16.5" r="1"></circle>
 </svg>'''
-    # fallback: druppel
     return _icon_svg("droplet")
 
 ICON_MAP = {
@@ -444,7 +459,7 @@ ICON_MAP = {
 def inject_heroicons(body_html: str) -> str:
     """
     Voeg vóór de 4 regels steeds een inline SVG-icoon toe.
-    - Stript eventuele bestaande emoji/img vóór het label.
+    - Stript eventuele emoji/img vóór het label.
     - Idempotent: als .bf-icon/data-heroicon al aanwezig is, laat staan.
     """
     if not body_html:
@@ -756,7 +771,7 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
                 ds = ", ".join(_f(x) for x in mm.get("diam_candidates", [])[:1]) or "-"
                 yield f"Metafields mapping → Hoogte-kandidaten: {hs}; Diameter-kandidaat: {ds}\n"
 
-            # Product-ids
+            # Product-IDs
             if collection_ids:
                 all_pids: List[int] = []
                 for cid in collection_ids:
@@ -818,7 +833,7 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
                 # --- AI parallel uitvoeren ---
                 ai_results: Dict[int, Dict[str, Any]] = {}
                 with ThreadPoolExecutor(max_workers=max(1, OPENAI_CONCURRENCY)) as ex:
-                    futures = {ex.submit(_openai_chat, sys_prompt, j[3], OPENAI_MODEL, OPENAI_TEMP): j for j in jobs}
+                    futures = {ex.submit(_openai_chat, sys_prompt, j[3], model, OPENAI_TEMP): j for j in jobs}
                     for fut in as_completed(futures):
                         pid, title, body_html, _ = futures[fut]
                         if _cancel_check(job_id):
@@ -832,58 +847,82 @@ def _stream_optimize(payload: Dict[str, Any]) -> Response:
                             ai_results[pid] = {"pieces": None, "title": title, "body": body_html, "error": e}
                             yield f"      · AI fout voor #{pid}: {e}\n"
 
-                # --- Resultaten verwerken + Shopify updaten ---
+                # --- Resultaten verwerken + Shopify updaten (defensief, gaat door bij fouten) ---
                 for p in prods:
-                    if _cancel_check(job_id): yield "⏹ Geannuleerd.\n"; break
+                    if _cancel_check(job_id):
+                        yield "⏹ Geannuleerd.\n"
+                        break
+
                     pid = int(p['id'])
                     res = ai_results.get(pid)
                     if not res or res["error"] or not res["pieces"]:
                         yield f"❌ OpenAI/Shopify-fout bij product #{pid}: {res['error'] if res else 'Geen AI-resultaat'}\n"
                         continue
 
-                    pieces = res["pieces"]
-                    title = res["title"]; body_html = res["body"]
-
-                    dims = parse_dimensions(pieces['title'] or title, pieces['body_html'] or body_html)
-                    pot_color = extract_pot_color(pieces['title'] or title, pieces['body_html'] or body_html)
-                    pot_present = detect_pot_presence(pieces['title'] or title, pieces['body_html'] or body_html)
-
-                    t1 = enforce_title_name_map(pieces['title'] or title, name_map)
-                    pieces['title'] = normalize_title(t1, dims, pot_color, pot_present)
-
-                    pieces['body_html'] = inject_heroicons(pieces['body_html'])
-
-                    final_meta_title = finalize_meta_title(pieces['meta_title'], pieces['title'],
-                                                           META_TITLE_LIMIT, BRAND_NAME, META_SUFFIX)
-                    final_meta_desc  = finalize_meta_desc(pieces['meta_description'],
-                                                          pieces['body_html'], pieces['title'], META_DESC_LIMIT)
-
                     try:
-                        update_product_texts(store, token, pid,
-                                             pieces['title'] or title,
-                                             pieces['body_html'] or body_html,
-                                             final_meta_title, final_meta_desc)
-                    except Exception as e:
-                        yield f"❌ Shopify update fout bij #{pid}: {e}\n"
-                        continue
+                        pieces = res["pieces"]
 
-                    to_write: Dict[str, str] = {}
-                    if dims.get("height_cm"): to_write["height_cm"] = dims["height_cm"]
-                    if dims.get("pot_diameter_cm"): to_write["pot_diameter_cm"] = dims["pot_diameter_cm"]
-                    if to_write:
+                        # Safe strings
+                        title_orig = _s(res["title"])
+                        body_orig  = _s(res["body"])
+                        title_ai   = _s(pieces.get('title')) or title_orig
+                        body_ai    = _s(pieces.get('body_html')) or body_orig
+                        meta_ai_t  = _s(pieces.get('meta_title'))
+                        meta_ai_d  = _s(pieces.get('meta_description'))
+
+                        # Dimensies & pot-info
+                        dims = parse_dimensions(title_ai, body_ai)
+                        if dims.get("height_cm"):
+                            hc = _safe_int_str(dims["height_cm"])
+                            if hc: dims["height_cm"] = hc
+                        if dims.get("pot_diameter_cm"):
+                            dc = _safe_int_str(dims["pot_diameter_cm"])
+                            if dc: dims["pot_diameter_cm"] = dc
+
+                        pot_color   = extract_pot_color(title_ai, body_ai)
+                        pot_present = detect_pot_presence(title_ai, body_ai)
+
+                        # Titel normaliseren & namen forceren
+                        t1 = enforce_title_name_map(title_ai, name_map)
+                        final_title = normalize_title(t1, dims, pot_color, pot_present)
+
+                        # Heroicons (inline SVG) injecteren
+                        final_body = inject_heroicons(body_ai)
+
+                        # Meta afronden
+                        final_meta_title = finalize_meta_title(meta_ai_t, final_title, META_TITLE_LIMIT, BRAND_NAME, META_SUFFIX)
+                        final_meta_desc  = finalize_meta_desc(meta_ai_d, final_body, final_title, META_DESC_LIMIT)
+
+                        # Shopify update (sequentieel)
                         try:
-                            written = set_product_metafields(token, store, pid, to_write)
-                            wlog = []
-                            if written.get("height"): wlog.append("hoogte→ " + ", ".join(written["height"]))
-                            if written.get("diam"):   wlog.append("diameter→ " + ", ".join(written["diam"]))
-                            yield f"   • Metafields gezet: {to_write}  ({'; '.join(wlog) or 'geen matches'})\n"
-                        except Exception as me:
-                            yield f"   • Metafields overslaan (fout): {me}\n"
-                    else:
-                        yield "   • Geen hoogte/diameter herkend\n"
+                            update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
+                        except Exception as e:
+                            yield f"❌ Shopify update fout bij #{pid}: {e}\n"
+                            continue
 
-                    processed += 1
-                    yield f"✅ #{pid} bijgewerkt: {(pieces['title'] or title)[:120]}\n"
+                        # Metafields (mirror naar meerdere definities indien ingesteld)
+                        to_write: Dict[str, str] = {}
+                        if dims.get("height_cm"):        to_write["height_cm"] = dims["height_cm"]
+                        if dims.get("pot_diameter_cm"):  to_write["pot_diameter_cm"] = dims["pot_diameter_cm"]
+
+                        if to_write:
+                            try:
+                                written = set_product_metafields(token, store, pid, to_write)
+                                wlog = []
+                                if written.get("height"): wlog.append("hoogte→ " + ", ".join(written["height"]))
+                                if written.get("diam"):   wlog.append("diameter→ " + ", ".join(written["diam"]))
+                                yield f"   • Metafields gezet: {to_write}  ({'; '.join(wlog) or 'geen matches'})\n"
+                            except Exception as me:
+                                yield f"   • Metafields overslaan (fout): {me}\n"
+                        else:
+                            yield "   • Geen hoogte/diameter herkend\n"
+
+                        processed += 1
+                        yield f"✅ #{pid} bijgewerkt: {final_title[:120]}\n"
+
+                    except Exception as e:
+                        tb = "".join(traceback.format_exception_only(type(e), e)).strip()
+                        yield f"❌ Product #{pid} overgeslagen door {tb}\n"
 
                     time.sleep(DELAY_PER_PRODUCT)
 
