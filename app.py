@@ -36,6 +36,8 @@ DELAY_PER_PRODUCT = float(os.environ.get("DELAY_SECONDS", "2.5"))
 SHOPIFY_RETRIES = int(os.environ.get("SHOPIFY_MAX_RETRIES", "4"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "60"))
 
+HEROICON_SIZE = int(os.environ.get("HEROICON_SIZE", "20"))  # px; maat voor inline heroicons
+
 # Merknaam / meta-suffix
 BRAND_NAME = os.environ.get("BRAND_NAME", "Belle Flora").strip()
 META_SUFFIX = f" | {BRAND_NAME}"
