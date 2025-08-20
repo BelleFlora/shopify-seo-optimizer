@@ -389,17 +389,230 @@ def _update_product(product_id: int, new_title: Optional[str], new_body_html: Op
 # ---------- Routes ----------
 
 @app.route("/", methods=["GET"])
-def home():
-    return (
-        "<h1>Belle Flora Optimizer</h1>"
-        "<p>Endpoints:</p>"
-        "<ul>"
-        "<li>POST /api/collections — laad & cache collecties</li>"
-        "<li>POST /api/optimize — optimaliseer 1 product (JSON: product_id, apply[=true|false])</li>"
-        "</ul>",
-        200,
-        {"Content-Type": "text/html; charset=utf-8"},
-    )
+def dashboard():
+    return Response("""<!doctype html>
+<html lang="nl"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Belle Flora Optimizer – Dashboard</title>
+<style>
+:root{--bg:#0b1020;--card:#121735;--txt:#eaf0ff;--muted:#a9b1d6;--btn:#4f7dff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+.wrap{max-width:1100px;margin:28px auto;padding:0 16px}
+.card{background:var(--card);border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.35);padding:20px;margin-bottom:16px}
+h1{margin:0 0 8px 0}label{display:block;margin:10px 0 6px}
+input,textarea,select{width:100%;padding:12px;border-radius:10px;border:1px solid #2a335a;background:#0f1430;color:var(--txt)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+button{padding:12px 16px;border:0;border-radius:12px;background:var(--btn);color:#fff;font-weight:600;cursor:pointer}
+.pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#243165;margin-left:8px;font-size:12px}
+pre{white-space:pre-wrap;max-height:360px;overflow:auto;background:#0f1430;border-radius:12px;padding:12px}
+small{color:var(--muted)}
+ul{margin:8px 0 0 16px;padding:0}
+</style></head><body>
+<div class="wrap">
+
+  <div class="card">
+    <h1>Belle Flora Optimizer</h1>
+    <small>Snelle test & batch optimalisatie. Gebruik env-vars of vul store/token hier in.</small>
+    <div class="row">
+      <div>
+        <label>Shopify Store domein <small>(optioneel – standaard via env)</small></label>
+        <input id="store" placeholder="belle-flora-be.myshopify.com"/>
+      </div>
+      <div>
+        <label>Shopify Access Token <small>(optioneel – standaard via env)</small></label>
+        <input id="token" placeholder="shpat_..." />
+      </div>
+    </div>
+    <div style="margin-top:8px">
+      <button id="btnLoad" onclick="loadCollections()">Collecties laden</button>
+      <span id="cstatus" class="pill">Nog niet geladen</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Optimaliseer één product</h2>
+    <div class="row">
+      <div>
+        <label>Product ID</label>
+        <input id="pid" placeholder="bijv. 9075892486402"/>
+      </div>
+      <div>
+        <label>Toepassen op Shopify?</label>
+        <select id="applySingle">
+          <option value="true">Ja – wijzigingen doorvoeren</option>
+          <option value="false">Nee – alleen voorbeeld</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <button id="btnRun" onclick="optimizeOne()">Optimaliseer product</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Batch optimalisatie (op basis van collecties)</h2>
+    <div class="row">
+      <div>
+        <label>Beschikbare collecties <small>(meervoudige selectie)</small></label>
+        <select id="collections" multiple size="10" style="height:220px;width:100%"></select>
+      </div>
+      <div>
+        <label>Opties</label>
+        <ul>
+          <li><label><input type="checkbox" id="applyBatch" checked> Wijzigingen doorvoeren op Shopify</label></li>
+          <li><label><input type="checkbox" id="stopOnError"> Stoppen bij eerste fout</label></li>
+          <li><label><input type="checkbox" id="slowMode"> Pauze 2s per item (rustig)</label></li>
+        </ul>
+        <div style="margin-top:8px">
+          <button id="btnBatch" onclick="runBatch()">Start batch</button>
+          <button id="btnCancel" onclick="cancelBatch()" disabled>Annuleer</button>
+        </div>
+        <div style="margin-top:10px"><small id="batchHint">Selecteer 1..n collecties en klik Start.</small></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Live status</h2>
+    <pre id="log">Klaar om te starten…</pre>
+  </div>
+
+</div>
+<script>
+const qs = s => document.querySelector(s);
+function setLog(t){qs('#log').textContent = t}
+function addLog(t){qs('#log').textContent += '\\n' + t}
+
+async function loadCollections(){
+  setLog('Collecties laden…');
+  try{
+    const body = {};
+    const store = qs('#store').value.trim();
+    const token = qs('#token').value.trim();
+    if(store) body.store = store;
+    if(token) body.token = token;
+
+    const res = await fetch('/api/collections', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const data = await res.json().catch(()=>null);
+    if(!res.ok){ addLog('❌ Fout ' + res.status + ': ' + (data && data.error || 'onbekend')); return; }
+    const list = Array.isArray(data) ? data : (data.collections || data || []);
+    const sel = qs('#collections'); sel.innerHTML = '';
+    list.forEach(c => {
+      const o = document.createElement('option');
+      o.value = String(c.id); o.textContent = `${c.title} (#${c.id})`;
+      sel.appendChild(o);
+    });
+    qs('#cstatus').textContent = `${list.length} collecties geladen`;
+    addLog('✅ Collecties geladen.');
+  }catch(e){ addLog('❌ Netwerkfout: ' + e.message); }
+}
+
+/* Single product */
+async function optimizeOne(){
+  const pid = qs('#pid').value.trim();
+  if(!pid){ setLog('Geef een Product ID op.'); return; }
+  setLog('Optimaliseren van product #' + pid + '…');
+  try{
+    const apply = qs('#applySingle').value === 'true';
+    const body = { product_id: Number(pid), apply };
+    const store = qs('#store').value.trim();
+    const token = qs('#token').value.trim();
+    if(store) body.store = store;
+    if(token) body.token = token;
+
+    const res = await fetch('/api/optimize', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const txt = await res.text();
+    try{ setLog(JSON.stringify(JSON.parse(txt), null, 2)); }
+    catch(_){ setLog(txt); }
+  }catch(e){ addLog('❌ Netwerkfout: ' + e.message); }
+}
+
+/* Batch */
+let CANCEL=false;
+function cancelBatch(){ CANCEL = true; qs('#btnCancel').disabled = true; addLog('⏹ Batch geannuleerd.'); }
+
+async function runBatch(){
+  const selected = Array.from(qs('#collections').selectedOptions).map(o => o.value);
+  if(selected.length === 0){ setLog('Selecteer minimaal één collectie.'); return; }
+
+  CANCEL = false; qs('#btnCancel').disabled = false;
+  const apply = qs('#applyBatch').checked;
+  const stopOnError = qs('#stopOnError').checked;
+  const slow = qs('#slowMode').checked;
+
+  const store = qs('#store').value.trim();
+  const token = qs('#token').value.trim();
+
+  let total=0, done=0, failed=0;
+  setLog('Batch gestart…');
+
+  for(const collId of selected){
+    if(CANCEL) break;
+
+    /* 1) product-id's ophalen voor de collectie */
+    addLog(`→ Collectie #${collId}: product-id's ophalen…`);
+    const body = { collection_id: Number(collId) };
+    if(store) body.store = store;
+    if(token) body.token = token;
+
+    let prods = [];
+    try{
+      const r = await fetch('/api/collection_products', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      const j = await r.json();
+      if(!r.ok) throw new Error(j && j.error || ('HTTP '+r.status));
+      prods = (j.product_ids || []);
+      total += prods.length;
+      addLog(`   • ${prods.length} producten gevonden`);
+    }catch(e){
+      addLog(`   ❌ Fout collectie ${collId}: ${e.message}`);
+      if(stopOnError){ addLog('Batch gestopt.'); qs('#btnCancel').disabled = true; return; }
+      continue;
+    }
+
+    /* 2) sequential optimize per product-id */
+    for(const pid of prods){
+      if(CANCEL) break;
+
+      try{
+        const payload = { product_id: pid, apply };
+        if(store) payload.store = store;
+        if(token) payload.token = token;
+
+        const res = await fetch('/api/optimize', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const txt = await res.text();
+        if(!res.ok){ throw new Error('HTTP '+res.status+' '+txt); }
+
+        done++;
+        const label = txt.startsWith('{') ? (JSON.parse(txt).result?.title || `#${pid}`) : `#${pid}`;
+        addLog(`   ✅ ${done}/${total} bijgewerkt: ${label}`);
+        if(slow) await new Promise(r=>setTimeout(r,2000));
+      }catch(e){
+        failed++;
+        addLog(`   ❌ Fout bij product #${pid}: ${e.message}`);
+        if(stopOnError){ addLog('Batch gestopt door stop-on-error.'); qs('#btnCancel').disabled = true; return; }
+      }
+    }
+  }
+
+  qs('#btnCancel').disabled = true;
+  addLog(`Klaar. Successen: ${done}, Fouten: ${failed}, Totaal: ${total}.`);
+}
+</script>
+</body></html>
+""", mimetype="text/html")
+
 
 @app.route("/api/collections", methods=["POST"])
 def api_collections():
@@ -443,6 +656,61 @@ def api_optimize():
             new_title=result.get("title"),
             new_body_html=result.get("body_html"),
         )
+from flask import request, jsonify, Response
+
+# Helper: eenvoudige Shopify GET met backoff (gebruik evt. je bestaande helper)
+def _shopify_get(url, token, params=None, timeout=60):
+    import time, requests
+    for i in range(3):
+        r = requests.get(url, headers={"X-Shopify-Access-Token": token}, params=params or {}, timeout=timeout)
+        if r.status_code == 429 and i < 2:
+            time.sleep(2 ** i)
+            continue
+        r.raise_for_status()
+        return r
+    r.raise_for_status()
+    return r
+
+@app.route("/api/collection_products", methods=["POST"])
+def api_collection_products():
+    """
+    Body JSON: { "collection_id": 1234567890, "store": "...(opt)", "token": "...(opt)" }
+    Response: { "collection_id": ..., "count": N, "product_ids": [ ... ] }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        store = (data.get("store") or os.environ.get("SHOPIFY_STORE_DOMAIN") or "").strip()
+        token = (data.get("token") or os.environ.get("SHOPIFY_ACCESS_TOKEN") or "").strip()
+        coll_id = data.get("collection_id")
+        if not (store and token and coll_id):
+            return jsonify({"error": "store/token/collection_id vereist"}), 400
+
+        # paginate collects → product_ids
+        product_ids, since_id = [], 0
+        while True:
+            r = _shopify_get(
+                f"https://{store}/admin/api/2024-07/collects.json",
+                token,
+                params={"collection_id": coll_id, "limit": 250, "since_id": since_id},
+                timeout=60
+            )
+            js = r.json()
+            collects = js.get("collects", []) or []
+            if not collects:
+                break
+            product_ids.extend([int(c["product_id"]) for c in collects])
+            since_id = collects[-1]["id"]
+            if len(collects) < 250:
+                break
+
+        product_ids = sorted(set(product_ids))
+        return jsonify({"collection_id": coll_id, "count": len(product_ids), "product_ids": product_ids})
+
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", 502)
+        return jsonify({"error": f"Shopify HTTP {code}: {getattr(e.response, 'text', str(e))}"}), code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
     return jsonify({
         "product_id": product_id,
