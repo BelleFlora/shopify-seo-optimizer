@@ -34,6 +34,9 @@ TRANSACTIONAL_CLAIMS = [
 
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "gpt-4o-mini")
+DEFAULT_TEMPERATURE = float(os.environ.get("DEFAULT_TEMPERATURE", 0.7))
 
 # =========================
 # Shopify API Helpers
@@ -89,8 +92,6 @@ HEROICONS = {
 # Volledige productieversie (deel 2/3)
 # ======================================
 
-import openai
-openai.api_key = os.environ.get("OPENAI_API_KEY")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "gpt-4o-mini")
 DEFAULT_TEMPERATURE = float(os.environ.get("DEFAULT_TEMPERATURE", 0.7))
 
@@ -191,17 +192,31 @@ Beschrijving: {body}
 # =========================
 
 def call_openai(prompt: str) -> str:
+    """Chat Completions via REST; geen 'openai' package nodig."""
+    if not OPENAI_API_KEY:
+        print("[OpenAI] OPENAI_API_KEY ontbreekt")
+        return ""
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": DEFAULT_MODEL,               # bijv. gpt-4o-mini
+        "temperature": DEFAULT_TEMPERATURE,
+        "messages": [
+            {"role": "system", "content": "Jij bent een e-commerce SEO specialist."},
+            {"role": "user", "content": prompt},
+        ],
+    }
     try:
-        response = openai.ChatCompletion.create(
-            model=DEFAULT_MODEL,
-            messages=[{"role": "system", "content": "Jij bent een e-commerce SEO specialist."},
-                      {"role": "user", "content": prompt}],
-            temperature=DEFAULT_TEMPERATURE,
-            max_tokens=600,
-        )
-        return response["choices"][0]["message"]["content"]
+        r = requests.post(url, headers=headers, json=body, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        return (data["choices"][0]["message"]["content"] or "").strip()
     except Exception as e:
-        print(f"[OpenAI error] {e}")
+        print(f"[OpenAI REST error] {e}")
         return ""
 
 # =========================
