@@ -1,4 +1,4 @@
-# app.py — Belle Flora SEO Optimizer (veilig + sequentieel + CSRF + sessie-creds)
+# app.py — Belle Flora SEO Optimizer (sessie-creds + CSRF + producten per collectie selecteren)
 import os, re, json, time, html, secrets
 from typing import Any, Dict, List, Optional, Tuple
 from functools import wraps
@@ -13,19 +13,16 @@ from flask import Flask, Response, jsonify, redirect, request, session, g
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_bytes(32))
 
-# Secure cookies & session
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=True,      # verwacht https in productie
+    SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 7,  # 7 dagen “remember me”
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 7,
 )
 
-# Admin
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "michiel")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "CHANGE_ME")
 
-# Defaults / Env
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "your-store.myshopify.com").strip()
 
 OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -42,7 +39,6 @@ META_SUFFIX      = f" | {BRAND_NAME}"
 META_TITLE_LIMIT = int(os.environ.get("META_TITLE_LIMIT", "60"))
 META_DESC_LIMIT  = int(os.environ.get("META_DESC_LIMIT", "155"))
 
-# Transactie/USP’s
 TRANSACTIONAL_MODE = os.environ.get("TRANSACTIONAL_MODE", "true").lower() in ("1","true","yes")
 TRANSACTIONAL_CLAIMS = [
     "Gratis verzending vanaf €49",
@@ -52,7 +48,6 @@ TRANSACTIONAL_CLAIMS = [
     "Top kwaliteit",
 ]
 
-# NL → Latijn (alleen waar relevant)
 NAME_MAP = {
     "Paradijsvogelplant": "Strelitzia",
     "Flamingoplant": "Anthurium",
@@ -66,20 +61,15 @@ NAME_MAP = {
     "ZZ-Plant": "Zamioculcas zamiifolia",
 }
 
-# Metafields autodetect/mirroring
 META_NAMESPACE_DEFAULT = os.environ.get("META_NAMESPACE_DEFAULT", "specs")
 META_HEIGHT_HINTS = [s for s in os.environ.get("META_HEIGHT_KEYS_HINT", "hoogte,height").split(",") if s.strip()]
 META_DIAM_HINTS   = [s for s in os.environ.get("META_DIAM_KEYS_HINT", "diameter,pot,ø,⌀").split(",") if s.strip()]
 META_MIRROR_MAX_HEIGHT = int(os.environ.get("META_MIRROR_MAX_HEIGHT", "2"))
 META_MIRROR_MAX_DIAM   = int(os.environ.get("META_MIRROR_MAX_DIAM", "1"))
 
-# Heroicons
 HEROICON_SIZE = int(os.environ.get("HEROICON_SIZE", "20"))
 
-# HTTP session
 REQ = requests.Session()
-
-# Caches
 _META_MAP_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # =========================
@@ -144,7 +134,6 @@ def _post(url: str, token: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
 def _gql_url(store_domain: str) -> str:
     return f"https://{store_domain}/admin/api/2025-01/graphql.json"
 
-# Credentials helper: JSON → session → env
 def _get_creds(payload: dict | None = None) -> tuple[str, str]:
     payload = payload or {}
     store = _normalize_store_domain(
@@ -338,7 +327,6 @@ def finalize_meta_title(raw: str, title_fallback: str) -> str:
     base = (raw or title_fallback or "").strip()
     if not base:
         return BRAND_NAME[:META_TITLE_LIMIT]
-    # knip geen “Belle Flora” middenin
     full = base + META_SUFFIX
     if len(full) <= META_TITLE_LIMIT:
         return full
@@ -468,6 +456,7 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
         out.append({"namespace": ns, "key": key, "name": name,
                     "type": (d.get("type") or {}).get("name") or "single_line_text_field",
                     "score": score})
+    out.sort(key=lambda x: x "score" if isinstance(x, dict) else 0, reverse=True)  # safety
     out.sort(key=lambda x: x["score"], reverse=True)
     return out
 
@@ -606,7 +595,18 @@ pre{white-space:pre-wrap}
 
   <div class="card">
     <label>Selecteer collecties</label>
-    <select id="collections" multiple size="12" style="height:260px"></select>
+    <select id="collections" multiple size="10" style="height:220px"></select>
+
+    <div style="margin-top:10px">
+      <button onclick="loadProductsForCollections()">Producten laden</button>
+      <span id="pstatus" class="pill">Geen producten geladen</span>
+    </div>
+
+    <div style="margin-top:10px">
+      <label>Producten in de geselecteerde collecties (de-selecteer wat je wil overslaan)</label>
+      <select id="products" multiple size="12" style="height:260px"></select>
+    </div>
+
     <div style="margin-top:12px">
       <label><input type="checkbox" id="txn" checked> Transactiefocus (koopwoorden + USP’s)</label>
       <div style="opacity:.8;margin-top:4px;font-size:12px;">USP’s: Gratis verzending vanaf €49 | Binnen 3 werkdagen geleverd | Soepel retourbeleid | Europese kwekers | Top kwaliteit</div>
@@ -668,18 +668,37 @@ async function loadCollections(){
   }catch(e){ addLog('❌ Netwerkfout: '+e.message); }
 }
 
+async function loadProductsForCollections(){
+  setLog('Producten ophalen…');
+  const ids=Array.from(qs('#collections').selectedOptions).map(o=>o.value);
+  if(ids.length===0){ addLog('Kies eerst 1 of meer collecties.'); return; }
+  const store=(qs('#store')?.value||'').trim();
+  const token=(qs('#token')?.value||'').trim();
+  try{
+    const res = await post('/api/collection-products',{store, token, collection_ids: ids});
+    const data = await res.json().catch(()=>null);
+    if(!res.ok){ addLog('❌ ' + (data && data.error ? data.error : ('Fout '+res.status))); return; }
+    const sel=qs('#products'); sel.innerHTML='';
+    (data||[]).forEach(p=>{
+      const o=document.createElement('option');
+      o.value=String(p.id); o.textContent=`#${p.id} — ${p.title}`; o.selected=true;
+      sel.appendChild(o);
+    });
+    qs('#pstatus').textContent = `${(data||[]).length} producten geladen (alles geselecteerd)`;
+    addLog('✅ Producten geladen.');
+  }catch(e){ addLog('❌ Netwerkfout: '+e.message); }
+}
+
 let abortCtrl=null, RUN=false;
 async function optimizeSelected(){
   if(RUN) return; RUN=true; qs('#btnCancel').disabled=false; setLog('Start optimalisatie…');
   abortCtrl=new AbortController();
-  const ids=Array.from(qs('#collections').selectedOptions).map(o=>o.value);
+  const collection_ids=Array.from(qs('#collections').selectedOptions).map(o=>o.value);
+  const product_ids=Array.from(qs('#products').selectedOptions).map(o=>o.value);
   const store=(qs('#store')?.value||'').trim();
   const token=(qs('#token')?.value||'').trim();
-  const res=await fetch('/api/optimize',{
-    method:'POST', signal:abortCtrl.signal,
-    headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
-    body: JSON.stringify({store, token, collection_ids: ids, txn: qs('#txn').checked})
-  });
+  const body={store, token, collection_ids, product_ids, txn: qs('#txn').checked};
+  const res=await fetch('/api/optimize',{method:'POST',signal:abortCtrl.signal,headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},body:JSON.stringify(body)});
   if(!res.ok){ addLog('❌ '+res.status); RUN=false; qs('#btnCancel').disabled=true; return; }
   const reader=res.body.getReader(); const dec=new TextDecoder();
   while(true){ const {value,done}=await reader.read(); if(done) break; addLog(dec.decode(value));}
@@ -692,6 +711,23 @@ function cancelJob(){ if(abortCtrl){ abortCtrl.abort(); addLog('⏹ Job geannule
 # =========================
 # Routes
 # =========================
+
+def _paged(path: str, token: str, params: Optional[Dict[str, Any]] = None, store: Optional[str] = None) -> List[Dict[str, Any]]:
+    store_domain = store or SHOPIFY_STORE_DOMAIN
+    p = dict(params or {}); p["limit"] = min(int(p.get("limit", 250)), 250)
+    since = 0; out: List[Dict[str, Any]] = []
+    while True:
+        p["since_id"] = since
+        url = f"https://{store_domain}{path}"
+        data = _get(url, token, params=p).json()
+        key = next((k for k in ("custom_collections", "smart_collections", "products", "collects") if k in data), None)
+        if not key: break
+        items = data.get(key, [])
+        if not items: break
+        out.extend(items)
+        since = items[-1]["id"]
+        if len(items) < p["limit"]: break
+    return out
 
 @app.route("/login", methods=["GET","POST"])
 def login():
@@ -707,7 +743,6 @@ def dashboard():
     html = DASHBOARD_HTML.replace("{{CSRF}}", g.csrf_token)
     return Response(html, mimetype="text/html")
 
-# Opslaan van store/token in sessie
 @app.post("/api/set-creds")
 @_require_login
 @require_csrf
@@ -744,22 +779,42 @@ def api_collections():
     except Exception as e:
         return jsonify({"error": f"Collecties laden mislukt: {e}"}), 400
 
-def _paged(path: str, token: str, params: Optional[Dict[str, Any]] = None, store: Optional[str] = None) -> List[Dict[str, Any]]:
-    store_domain = store or SHOPIFY_STORE_DOMAIN
-    p = dict(params or {}); p["limit"] = min(int(p.get("limit", 250)), 250)
-    since = 0; out: List[Dict[str, Any]] = []
-    while True:
-        p["since_id"] = since
-        url = f"https://{store_domain}{path}"
-        data = _get(url, token, params=p).json()
-        key = next((k for k in ("custom_collections", "smart_collections", "products", "collects") if k in data), None)
-        if not key: break
-        items = data.get(key, [])
-        if not items: break
-        out.extend(items)
-        since = items[-1]["id"]
-        if len(items) < p["limit"]: break
-    return out
+# >>> Nieuw: producten uit geselecteerde collecties ophalen
+@app.post("/api/collection-products")
+@_require_login
+@require_csrf
+def api_collection_products():
+    try:
+        data = request.get_json(force=True) or {}
+        store, token = _get_creds(data)
+        coll_ids = data.get("collection_ids") or []
+        if not store or not token:
+            return jsonify({"error":"Store of token ontbreekt."}), 400
+        if not coll_ids:
+            return jsonify([])
+
+        # Verzamel unieke product_ids via collects
+        pid_set = set()
+        for cid in coll_ids:
+            collects = _get(f"https://{store}/admin/api/2024-07/collects.json", token,
+                            params={"collection_id": cid, "limit": 250}).json().get("collects", [])
+            for c in collects:
+                pid_set.add(int(c["product_id"]))
+
+        pids = sorted(pid_set)
+        products: List[Dict[str, Any]] = []
+        for i in range(0, len(pids), 50):
+            batch = pids[i:i+50]
+            r = _get(f"https://{store}/admin/api/2024-07/products.json", token,
+                     params={"ids": ",".join(map(str, batch)), "limit": 250})
+            prods = r.json().get("products", [])
+            for p in prods:
+                products.append({"id": int(p["id"]), "title": p.get("title","")})
+
+        products.sort(key=lambda x: (x["title"].lower(), x["id"]))
+        return jsonify(products)
+    except Exception as e:
+        return jsonify({"error": f"Producten laden mislukt: {e}"}), 400
 
 @app.route("/api/optimize", methods=["POST"])
 @_require_login
@@ -769,6 +824,7 @@ def api_optimize():
     store, token = _get_creds(payload)
     txn   = bool(payload.get("txn", TRANSACTIONAL_MODE))
     colls = payload.get("collection_ids") or []
+    explicit_pids = payload.get("product_ids") or []
     if not store or not token:
         return Response("Store of token ontbreekt.\n", mimetype="text/plain", status=400)
     if not OPENAI_API_KEY:
@@ -778,69 +834,81 @@ def api_optimize():
 
     def stream():
         try:
+            # Stel de te verwerken producten vast:
+            pid_list: List[int] = []
+            if explicit_pids:
+                pid_list = [int(x) for x in explicit_pids]
+                yield f"{len(pid_list)} expliciet geselecteerde producten ontvangen.\n"
+            else:
+                # uit collecties halen
+                pid_set = set()
+                for coll_id in colls:
+                    url=f"https://{store}/admin/api/2024-07/collects.json"
+                    collects=_get(url, token, params={"collection_id":coll_id,"limit":250}).json().get("collects",[])
+                    for c in collects:
+                        pid_set.add(int(c["product_id"]))
+                pid_list = sorted(pid_set)
+                yield f"{len(pid_list)} producten gevonden uit collecties.\n"
+
             total_updated = 0
-            if not colls:
-                yield "Geen collecties geselecteerd.\n"
+            if not pid_list:
+                yield "Niets te doen (lege selectie).\n"
                 return
 
-            for coll_id in colls:
-                url=f"https://{store}/admin/api/2024-07/collects.json"
-                collects=_get(url, token, params={"collection_id":coll_id,"limit":250}).json().get("collects",[])
-                pids=[int(c["product_id"]) for c in collects]
-                yield f"Collectie {coll_id}: {len(pids)} producten gevonden\n"
+            # chunken naar /products.json batches
+            for i in range(0, len(pid_list), 50):
+                batch_ids = pid_list[i:i+50]
+                r=_get(f"https://{store}/admin/api/2024-07/products.json", token,
+                       params={"ids":",".join(map(str,batch_ids)),"limit":250})
+                prods=r.json().get("products",[])
+                for p in prods:
+                    pid=int(p["id"])
+                    title=_s(p.get("title",""))
+                    body=_s(p.get("body_html",""))
+                    base_prompt=(f"Originele titel: {title}\n"
+                                 f"Originele beschrijving (HTML toegestaan): {body}\n"
+                                 "Taken:\n"
+                                 "1) Lever ‘Nieuwe titel’ volgens format.\n"
+                                 "2) Lever ‘Beschrijving’ (HTML) met vaste h3-secties en 4 regels.\n"
+                                 "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n")
+                    try:
+                        yield f"→ #{pid}: AI-tekst genereren...\n"
+                        ai_raw=_openai_chat(sys_prompt, base_prompt)
+                        pieces=split_ai_output(ai_raw)
 
-                for i in range(0, len(pids), 50):
-                    batch=pids[i:i+50]
-                    r=_get(f"https://{store}/admin/api/2024-07/products.json", token, params={"ids":",".join(map(str,batch)),"limit":250})
-                    prods=r.json().get("products",[])
-                    for p in prods:
-                        pid=int(p["id"])
-                        title=_s(p.get("title",""))
-                        body=_s(p.get("body_html",""))
-                        base_prompt=(f"Originele titel: {title}\n"
-                                     f"Originele beschrijving (HTML toegestaan): {body}\n"
-                                     "Taken:\n"
-                                     "1) Lever ‘Nieuwe titel’ volgens format.\n"
-                                     "2) Lever ‘Beschrijving’ (HTML) met vaste h3-secties en 4 regels.\n"
-                                     "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n")
-                        try:
-                            yield f"→ #{pid}: AI-tekst genereren...\n"
-                            ai_raw=_openai_chat(sys_prompt, base_prompt)
-                            pieces=split_ai_output(ai_raw)
+                        title_ai=enforce_title_name_map(_s(pieces.get("title")) or title)
+                        body_ai=_s(pieces.get("body_html")) or body
 
-                            title_ai=enforce_title_name_map(_s(pieces.get("title")) or title)
-                            body_ai=_s(pieces.get("body_html")) or body
+                        dims=parse_dimensions(title_ai, body_ai)
+                        pot_color=extract_pot_color(title_ai, body_ai)
+                        pot_present=detect_pot_presence(title_ai, body_ai)
 
-                            dims=parse_dimensions(title_ai, body_ai)
-                            pot_color=extract_pot_color(title_ai, body_ai)
-                            pot_present=detect_pot_presence(title_ai, body_ai)
+                        final_title=normalize_title(title_ai, dims, pot_color, pot_present)
+                        final_body =inject_heroicons(body_ai)
 
-                            final_title=normalize_title(title_ai, dims, pot_color, pot_present)
-                            final_body =inject_heroicons(body_ai)
+                        final_meta_title=finalize_meta_title(pieces.get("meta_title"), final_title)
+                        final_meta_desc =finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
 
-                            final_meta_title=finalize_meta_title(pieces.get("meta_title"), final_title)
-                            final_meta_desc =finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
+                        update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
 
-                            update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
+                        missing={}
+                        if dims.get("height_cm"):       missing["height_cm"]=dims["height_cm"]
+                        if dims.get("pot_diameter_cm"): missing["pot_diameter_cm"]=dims["pot_diameter_cm"]
+                        if missing:
+                            w=set_product_metafields(token, store, pid, missing)
+                            yield f"   • Metafields aangevuld: {missing} → {w}\n"
+                        else:
+                            yield "   • Metafields al aanwezig of geen waarden gevonden\n"
 
-                            missing={}
-                            if dims.get("height_cm"):       missing["height_cm"]=dims["height_cm"]
-                            if dims.get("pot_diameter_cm"): missing["pot_diameter_cm"]=dims["pot_diameter_cm"]
-                            if missing:
-                                w=set_product_metafields(token, store, pid, missing)
-                                yield f"   • Metafields aangevuld: {missing} → {w}\n"
-                            else:
-                                yield "   • Metafields al aanwezig of geen waarden gevonden\n"
+                        total_updated += 1
+                        yield f"✅ #{pid} bijgewerkt: {final_title}\n"
 
-                            total_updated += 1
-                            yield f"✅ #{pid} bijgewerkt: {final_title}\n"
+                    except Exception as e:
+                        yield f"❌ Fout bij product #{pid}: {e}\n"
 
-                        except Exception as e:
-                            yield f"❌ Fout bij product #{pid}: {e}\n"
+                    time.sleep(DELAY_PER_PRODUCT)
 
-                        time.sleep(DELAY_PER_PRODUCT)
-
-                    yield f"-- Batch klaar ({len(prods)} producten) --\n"
+                yield f"-- Batch klaar ({len(prods)} producten) --\n"
 
             yield f"Klaar. Totaal bijgewerkt: {total_updated}\n"
         except Exception as e:
