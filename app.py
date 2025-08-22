@@ -456,9 +456,9 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
         out.append({"namespace": ns, "key": key, "name": name,
                     "type": (d.get("type") or {}).get("name") or "single_line_text_field",
                     "score": score})
-    out.sort(key=lambda x: x "score" if isinstance(x, dict) else 0, reverse=True)  # safety
-    out.sort(key=lambda x: x["score"], reverse=True)
+    out.sort(key=lambda x: x.get("score", 0), reverse=True)
     return out
+
 
 def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
     cache_key = store_domain
