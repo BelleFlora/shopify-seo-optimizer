@@ -2,15 +2,47 @@ services:
   - type: web
     name: shopify-seo-optimizer
     env: python
-    plan: free
+    plan: starter
+    # (optioneel) pin Python-versie
+    pythonVersion: 3.13.0
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    startCommand: gunicorn app:app --timeout 600 --graceful-timeout 120 --keep-alive 5 --threads 2 --worker-class gthread
+    autoDeploy: true
     envVars:
+      - key: FLASK_SECRET
+        generateValue: true
       - key: ADMIN_USERNAME
         value: michiel
       - key: ADMIN_PASSWORD
-        sync: false   # zet dit handmatig in Render dashboard
+        sync: false           # zet secret in Render dashboard
       - key: SHOPIFY_STORE_DOMAIN
-        value: your-store.myshopify.com
-      - key: FLASK_SECRET
-        generateValue: true
+        value: belle-flora-be.myshopify.com
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false           # zet secret in Render dashboard
+      - key: OPENAI_API_KEY
+        sync: false           # zet secret in Render dashboard
+      - key: DEFAULT_MODEL
+        value: gpt-4o-mini
+      - key: DEFAULT_TEMPERATURE
+        value: "0.7"
+      # — OpenAI robuustheid (matcht je app.py) —
+      - key: OPENAI_HTTP_TIMEOUT
+        value: "45"
+      - key: OPENAI_MAX_RETRIES
+        value: "3"
+      - key: OPENAI_BACKOFF_BASE
+        value: "2"
+      # — Shopify/throughput —
+      - key: SHOPIFY_MAX_RETRIES
+        value: "4"
+      - key: REQUEST_TIMEOUT
+        value: "60"
+      - key: DELAY_SECONDS
+        value: "0.8"
+      # — Branding/SEO limieten (optioneel) —
+      - key: BRAND_NAME
+        value: Belle Flora
+      - key: META_TITLE_LIMIT
+        value: "60"
+      - key: META_DESC_LIMIT
+        value: "155"
