@@ -1,4 +1,4 @@
-# app.py — Belle Flora SEO Optimizer (sessie-creds + CSRF + producten per collectie selecteren)
+# app.py — Belle Flora SEO Optimizer (sessie-creds + CSRF + producten per collectie selecteren + robuuste Shopify logging)
 import os, re, json, time, html, secrets
 from typing import Any, Dict, List, Optional, Tuple
 from functools import wraps
@@ -28,15 +28,12 @@ SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "your-store.myshop
 OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL     = os.environ.get("DEFAULT_MODEL", "gpt-4o-mini")
 OPENAI_TEMP      = float(os.environ.get("DEFAULT_TEMPERATURE", "0.7"))
-
-# Nieuwe, striktere OpenAI-parameters (timeouts & retries)
-OPENAI_HTTP_TIMEOUT = float(os.environ.get("OPENAI_HTTP_TIMEOUT", "45"))   # sec per HTTP attempt
-OPENAI_MAX_RETRIES  = int(os.environ.get("OPENAI_MAX_RETRIES", "3"))       # totale attempts
-OPENAI_BACKOFF_BASE = float(os.environ.get("OPENAI_BACKOFF_BASE", "2"))    # 1,2,4,…
+OPENAI_RETRIES   = int(os.environ.get("OPENAI_MAX_RETRIES", "4"))
 
 DELAY_PER_PRODUCT  = float(os.environ.get("DELAY_SECONDS", "0.8"))
 SHOPIFY_RETRIES    = int(os.environ.get("SHOPIFY_MAX_RETRIES", "4"))
-REQUEST_TIMEOUT    = int(os.environ.get("REQUEST_TIMEOUT", "60"))
+# ↓ kortere default timeout zodat we niet ‘stil’ hangen op netwerkproblemen
+REQUEST_TIMEOUT    = int(os.environ.get("REQUEST_TIMEOUT", "20"))
 
 BRAND_NAME       = os.environ.get("BRAND_NAME", "Belle Flora").strip()
 META_SUFFIX      = f" | {BRAND_NAME}"
@@ -120,20 +117,56 @@ def _shopify_headers(token: str) -> Dict[str, str]:
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json", "Accept": "application/json"}
 
 def _get(url: str, token: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    # Debug log (zonder token)
+    try:
+        print(f"[HTTP GET] {url} params={params or {}} timeout={REQUEST_TIMEOUT}s")
+    except Exception:
+        pass
+    last_exc = None
     for i in range(SHOPIFY_RETRIES):
-        r = REQ.get(url, headers=_shopify_headers(token), params=params or {}, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
-            time.sleep(float(r.headers.get("Retry-After", 2 ** i))); continue
-        r.raise_for_status(); return r
-    r.raise_for_status(); return r
+        try:
+            r = REQ.get(url, headers=_shopify_headers(token), params=params or {}, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
+                retry = float(r.headers.get("Retry-After", 2 ** i))
+                print(f"[HTTP GET] 429 rate limited, retry in {retry}s")
+                time.sleep(retry); continue
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_exc = e
+            print(f"[HTTP GET] attempt {i+1}/{SHOPIFY_RETRIES} failed: {e}")
+            if i < SHOPIFY_RETRIES - 1:
+                time.sleep(2 ** i)
+    # Laatste raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("HTTP GET unknown failure")
 
 def _post(url: str, token: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
+    # Debug log (zonder token, toont geen volledige body om ruis te beperken)
+    try:
+        short = {k: ("<omitted>" if k in ("variables", "query") else v) for k, v in (json_body or {}).items()}
+        print(f"[HTTP POST] {url} body_keys={list(json_body.keys())} timeout={REQUEST_TIMEOUT}s short={short}")
+    except Exception:
+        pass
+    last_exc = None
     for i in range(SHOPIFY_RETRIES):
-        r = REQ.post(url, headers=_shopify_headers(token), json=json_body, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
-            time.sleep(float(r.headers.get("Retry-After", 2 ** i))); continue
-        r.raise_for_status(); return r.json()
-    r.raise_for_status(); return r.json()
+        try:
+            r = REQ.post(url, headers=_shopify_headers(token), json=json_body, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
+                retry = float(r.headers.get("Retry-After", 2 ** i))
+                print(f"[HTTP POST] 429 rate limited, retry in {retry}s")
+                time.sleep(retry); continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_exc = e
+            print(f"[HTTP POST] attempt {i+1}/{SHOPIFY_RETRIES} failed: {e}")
+            if i < SHOPIFY_RETRIES - 1:
+                time.sleep(2 ** i)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("HTTP POST unknown failure")
 
 def _gql_url(store_domain: str) -> str:
     return f"https://{store_domain}/admin/api/2025-01/graphql.json"
@@ -152,7 +185,7 @@ def _get_creds(payload: dict | None = None) -> tuple[str, str]:
     return store, token
 
 # =========================
-# Prompts & OpenAI (met strikte timeouts + retries)
+# Prompts & OpenAI
 # =========================
 
 def _build_system_prompt(txn: bool) -> str:
@@ -188,75 +221,27 @@ def _build_system_prompt(txn: bool) -> str:
         "Meta description: …\n"
     )
 
-def _openai_chat(system_prompt: str, user_prompt: str, status_log: Optional[List[str]] = None) -> str:
-    """
-    Robuuste Chat Completions wrapper:
-      - strikte timeout per poging
-      - max retries met exponentiële backoff
-      - optionele status_log[] waar korte meldingen aan toegevoegd worden
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY ontbreekt.")
-
+def _openai_chat(sys_prompt: str, user_prompt: str) -> str:
+    if not OPENAI_API_KEY: raise RuntimeError("OPENAI_KEY ontbreekt.")
     url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENAI_MODEL,
-        "temperature": OPENAI_TEMP,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-    }
-
-    start = time.monotonic()
-    last_err = None
-
-    for attempt in range(1, OPENAI_MAX_RETRIES + 1):
+    body = {"model": OPENAI_MODEL, "temperature": OPENAI_TEMP,
+            "messages": [{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}]}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    last_exc = None
+    for i in range(OPENAI_RETRIES):
         try:
-            if status_log is not None:
-                status_log.append(f"   • OpenAI attempt {attempt}/{OPENAI_MAX_RETRIES} (timeout {OPENAI_HTTP_TIMEOUT:.0f}s)…\n")
-
-            r = REQ.post(url, headers=headers, json=payload, timeout=OPENAI_HTTP_TIMEOUT)
-
-            if r.status_code == 429:
-                # rate limit – backoff en opnieuw
-                retry_after = float(r.headers.get("Retry-After", OPENAI_BACKOFF_BASE ** (attempt - 1)))
-                if status_log is not None:
-                    status_log.append(f"   • Rate limited (429). Wachten {retry_after:.1f}s…\n")
-                time.sleep(retry_after)
-                continue
-
+            r = REQ.post(url, headers=headers, json=body, timeout=120)
+            if r.status_code == 429 and i < OPENAI_RETRIES - 1:
+                time.sleep(2 ** i); continue
             r.raise_for_status()
-            data = r.json()
-            out = data["choices"][0]["message"]["content"]
-            if status_log is not None:
-                status_log.append(f"   • OpenAI klaar in {time.monotonic()-start:.1f}s\n")
-            return out
-
-        except requests.Timeout:
-            last_err = f"timeout na {OPENAI_HTTP_TIMEOUT:.0f}s (attempt {attempt})"
-            if status_log is not None:
-                status_log.append(f"   • OpenAI timeout: {last_err}\n")
-        except requests.RequestException as e:
-            last_err = f"HTTP fout: {getattr(e.response, 'status_code', 'n/a')} {str(e)[:180]}"
-            if status_log is not None:
-                status_log.append(f"   • OpenAI HTTP-fout: {last_err}\n")
+            return r.json()["choices"][0]["message"]["content"]
         except Exception as e:
-            last_err = f"Onverwachte fout: {str(e)[:180]}"
-            if status_log is not None:
-                status_log.append(f"   • OpenAI fout: {last_err}\n")
-
-        if attempt < OPENAI_MAX_RETRIES:
-            sleep_s = OPENAI_BACKOFF_BASE ** (attempt - 1)
-            if status_log is not None:
-                status_log.append(f"   • Backoff {sleep_s:.1f}s…\n")
-            time.sleep(sleep_s)
-
-    raise RuntimeError(f"OpenAI mislukt na {OPENAI_MAX_RETRIES} pogingen: {last_err or 'onbekende fout'}")
+            last_exc = e
+            if i < OPENAI_RETRIES - 1:
+                time.sleep(2 ** i)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("OpenAI unknown failure")
 
 def split_ai_output(text: str) -> Dict[str, str]:
     lines = [l.rstrip() for l in (text or "").splitlines()]
@@ -471,6 +456,7 @@ def inject_heroicons(body_html: str) -> str:
 
 def update_product_texts(store_domain: str, token: str, product_id: int,
                          new_title: str, new_body_html: str, seo_title: str, seo_desc: str) -> None:
+    gid = f"gid://shopify/Product/{int(product_id)}"
     mutation = """
     mutation productSeoAndDesc($input: ProductInput!) {
       productUpdate(input: $input) {
@@ -478,12 +464,19 @@ def update_product_texts(store_domain: str, token: str, product_id: int,
         userErrors { field message }
       }
     }"""
-    gid = f"gid://shopify/Product/{int(product_id)}"
-    variables = {"input": {"id": gid, "title": new_title, "descriptionHtml": new_body_html,
-                           "seo": {"title": seo_title or new_title, "description": seo_desc or ""}}}
-    data = _post(_gql_url(store_domain), token, {"query": mutation, "variables": variables})
-    errs = (data.get("data", {}).get("productUpdate", {}) or {}).get("userErrors", [])
-    if errs: raise RuntimeError(f"Shopify productUpdate: {errs}")
+    variables = {"input": {
+        "id": gid,
+        "title": new_title,
+        "descriptionHtml": new_body_html,
+        "seo": {"title": seo_title or new_title, "description": seo_desc or ""}
+    }}
+    try:
+        data = _post(_gql_url(store_domain), token, {"query": mutation, "variables": variables})
+        errs = (data.get("data", {}).get("productUpdate", {}) or {}).get("userErrors", [])
+        if errs:
+            raise RuntimeError(f"Shopify productUpdate: {errs}")
+    except Exception as e:
+        raise RuntimeError(f"Shopify update_product_texts fout: {e}")
 
 def _defs_for_product(token: str, store_domain: str) -> List[Dict[str, Any]]:
     query = """
@@ -930,16 +923,12 @@ def api_optimize():
                                  "2) Lever ‘Beschrijving’ (HTML) met vaste h3-secties en 4 regels.\n"
                                  "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n")
                     try:
+                        t0 = time.time()
                         yield f"→ #{pid}: AI-tekst genereren...\n"
-
-                        # verzamel OpenAI statusmeldingen en stuur ze na afloop door
-                        _status: List[str] = []
-                        ai_raw = _openai_chat(sys_prompt, base_prompt, status_log=_status)
-                        for line in _status:
-                            yield line
+                        ai_raw=_openai_chat(sys_prompt, base_prompt)
+                        yield f"   • OpenAI klaar in {time.time()-t0:.1f}s\n"
 
                         pieces=split_ai_output(ai_raw)
-
                         title_ai=enforce_title_name_map(_s(pieces.get("title")) or title)
                         body_ai=_s(pieces.get("body_html")) or body
 
@@ -953,14 +942,21 @@ def api_optimize():
                         final_meta_title=finalize_meta_title(pieces.get("meta_title"), final_title)
                         final_meta_desc =finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
 
+                        # Shopify productUpdate
+                        yield f"   • Shopify update starten voor #{pid}…\n"
+                        t1 = time.time()
                         update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
+                        yield f"   • Shopify update klaar in {time.time()-t1:.1f}s\n"
 
+                        # Metafields
                         missing={}
                         if dims.get("height_cm"):       missing["height_cm"]=dims["height_cm"]
                         if dims.get("pot_diameter_cm"): missing["pot_diameter_cm"]=dims["pot_diameter_cm"]
                         if missing:
+                            yield f"   • Metafields zetten: {missing}\n"
+                            t2 = time.time()
                             w=set_product_metafields(token, store, pid, missing)
-                            yield f"   • Metafields aangevuld: {missing} → {w}\n"
+                            yield f"   • Metafields gezet in {time.time()-t2:.1f}s → {w}\n"
                         else:
                             yield "   • Metafields al aanwezig of geen waarden gevonden\n"
 
@@ -981,23 +977,12 @@ def api_optimize():
     return Response(stream(), mimetype="text/plain", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 # =========================
-# Health & Selftest
+# Health
 # =========================
 
 @app.get("/healthz")
 def healthz():
     return "ok", 200
-
-@app.post("/api/selftest")
-@_require_login
-@require_csrf
-def api_selftest():
-    try:
-        out = _openai_chat("Je bent een korte echo-tester.", "Antwoord met exact: OK", status_log=None)
-        ok = (out or "").strip().upper().startswith("OK")
-        return jsonify({"openai_ok": bool(ok), "raw": (out or "")[:120]})
-    except Exception as e:
-        return jsonify({"openai_ok": False, "error": str(e)}), 500
 
 # =========================
 # Main
