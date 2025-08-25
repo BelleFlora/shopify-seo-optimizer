@@ -429,25 +429,47 @@ def _icon_svg(name: str) -> str:
     return _icon_svg("droplet")
 
 def inject_heroicons(body_html: str) -> str:
-    if not body_html: return body_html
+    """
+    Veilige, snelle injectie zonder zware regex.
+    We dekken de meest voorkomende varianten af door directe string-replacements.
+    Als er al een bf-icon aanwezig is, doen we niets.
+    """
+    if not body_html:
+        return body_html
     if 'class="bf-icon"' in body_html or 'data-heroicon=' in body_html:
         return body_html
+
+    # Heel grote HTML? Sla icon-injectie over om performance te garanderen.
+    if len(body_html) > 20000:
+        return body_html
+
     out = body_html
-    def _inject(label: str, icon_html: str, html_) -> str:
-        rx = re.compile(
-            rf'(<p[^>]*>\s*)'
-            rf'(?:<img[^>]*>\s*|<svg[^>]*>\s*</svg>\s*|[\u2600-\u27BF\u1F300-\u1FAFF\s]*?)*'
-            rf'(?:(?:<strong>)\s*)?{label}\s*(?::)?\s*(?:</strong>)?\s*(.*?)(</p>)',
-            re.I | re.S
-        )
-        def repl(m):
-            pre, rest, end = m.group(1), m.group(2), m.group(3)
-            return f'{pre}{icon_html}<strong>{label}</strong>: {rest}{end}'
-        return rx.sub(repl, html_)
-    out = _inject("Lichtbehoefte", _icon_svg("sun"), out)
-    out = _inject("Waterbehoefte", _icon_svg("droplet"), out)
-    out = _inject("Standplaats",   _icon_svg("home"), out)
-    out = _inject("Giftigheid",    _icon_svg("exclamation-triangle"), out)
+
+    def add_icon(out_html: str, label: str, icon_svg: str) -> str:
+        # Al icon aanwezig voor dit label? (heel simpele check)
+        if f'data-heroicon="' in out_html and f">{label}</strong>:" in out_html:
+            return out_html
+
+        # Vervang de meest voorkomende vormen. Geen regex → geen backtracking.
+        patterns = [
+            f"<p><strong>{label}</strong>:",         # 1) <p><strong>Label</strong>:
+            f"<p> <strong>{label}</strong>:",        # 2) spatievarianten
+            f"<p><strong>{label}</strong> :",        # 3)
+            f"<p>{label}:",                          # 4) <p>Label:
+            f"<p> {label}:",                         # 5)
+        ]
+        for pat in patterns:
+            if pat in out_html:
+                return out_html.replace(pat, f"<p>{icon_svg}<strong>{label}</strong>:", 1)
+
+        # Als niets matcht, laat zoals het is.
+        return out_html
+
+    out = add_icon(out, "Lichtbehoefte", _icon_svg("sun"))
+    out = add_icon(out, "Waterbehoefte", _icon_svg("droplet"))
+    out = add_icon(out, "Standplaats",   _icon_svg("home"))
+    out = add_icon(out, "Giftigheid",    _icon_svg("exclamation-triangle"))
+
     return out
 
 # =========================
@@ -937,10 +959,12 @@ def api_optimize():
                         pot_present=detect_pot_presence(title_ai, body_ai)
 
                         final_title=normalize_title(title_ai, dims, pot_color, pot_present)
-                        final_body =inject_heroicons(body_ai)
+                        yield "   • Iconen injecteren…\n"
+                        final_body = inject_heroicons(body_ai)
+                        yield "   • Iconen klaar\n"
 
-                        final_meta_title=finalize_meta_title(pieces.get("meta_title"), final_title)
-                        final_meta_desc =finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
+                        final_meta_title = finalize_meta_title(pieces.get("meta_title"), final_title)
+                        final_meta_desc  = finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
 
                         # Shopify productUpdate
                         yield f"   • Shopify update starten voor #{pid}…\n"
