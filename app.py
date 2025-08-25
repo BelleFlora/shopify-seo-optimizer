@@ -28,7 +28,11 @@ SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "your-store.myshop
 OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL     = os.environ.get("DEFAULT_MODEL", "gpt-4o-mini")
 OPENAI_TEMP      = float(os.environ.get("DEFAULT_TEMPERATURE", "0.7"))
-OPENAI_RETRIES   = int(os.environ.get("OPENAI_MAX_RETRIES", "4"))
+
+# Nieuwe, striktere OpenAI-parameters (timeouts & retries)
+OPENAI_HTTP_TIMEOUT = float(os.environ.get("OPENAI_HTTP_TIMEOUT", "45"))   # sec per HTTP attempt
+OPENAI_MAX_RETRIES  = int(os.environ.get("OPENAI_MAX_RETRIES", "3"))       # totale attempts
+OPENAI_BACKOFF_BASE = float(os.environ.get("OPENAI_BACKOFF_BASE", "2"))    # 1,2,4,…
 
 DELAY_PER_PRODUCT  = float(os.environ.get("DELAY_SECONDS", "0.8"))
 SHOPIFY_RETRIES    = int(os.environ.get("SHOPIFY_MAX_RETRIES", "4"))
@@ -148,7 +152,7 @@ def _get_creds(payload: dict | None = None) -> tuple[str, str]:
     return store, token
 
 # =========================
-# Prompts & OpenAI
+# Prompts & OpenAI (met strikte timeouts + retries)
 # =========================
 
 def _build_system_prompt(txn: bool) -> str:
@@ -184,20 +188,75 @@ def _build_system_prompt(txn: bool) -> str:
         "Meta description: …\n"
     )
 
-def _openai_chat(sys_prompt: str, user_prompt: str) -> str:
-    if not OPENAI_API_KEY: raise RuntimeError("OPENAI_KEY ontbreekt.")
+def _openai_chat(system_prompt: str, user_prompt: str, status_log: Optional[List[str]] = None) -> str:
+    """
+    Robuuste Chat Completions wrapper:
+      - strikte timeout per poging
+      - max retries met exponentiële backoff
+      - optionele status_log[] waar korte meldingen aan toegevoegd worden
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY ontbreekt.")
+
     url = "https://api.openai.com/v1/chat/completions"
-    body = {"model": OPENAI_MODEL, "temperature": OPENAI_TEMP,
-            "messages": [{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}]}
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    for i in range(OPENAI_RETRIES):
-        r = REQ.post(url, headers=headers, json=body, timeout=120)
-        if r.status_code == 429 and i < OPENAI_RETRIES - 1:
-            time.sleep(2 ** i); continue
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    r.raise_for_status()
-    return ""
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": OPENAI_TEMP,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+    }
+
+    start = time.monotonic()
+    last_err = None
+
+    for attempt in range(1, OPENAI_MAX_RETRIES + 1):
+        try:
+            if status_log is not None:
+                status_log.append(f"   • OpenAI attempt {attempt}/{OPENAI_MAX_RETRIES} (timeout {OPENAI_HTTP_TIMEOUT:.0f}s)…\n")
+
+            r = REQ.post(url, headers=headers, json=payload, timeout=OPENAI_HTTP_TIMEOUT)
+
+            if r.status_code == 429:
+                # rate limit – backoff en opnieuw
+                retry_after = float(r.headers.get("Retry-After", OPENAI_BACKOFF_BASE ** (attempt - 1)))
+                if status_log is not None:
+                    status_log.append(f"   • Rate limited (429). Wachten {retry_after:.1f}s…\n")
+                time.sleep(retry_after)
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+            out = data["choices"][0]["message"]["content"]
+            if status_log is not None:
+                status_log.append(f"   • OpenAI klaar in {time.monotonic()-start:.1f}s\n")
+            return out
+
+        except requests.Timeout:
+            last_err = f"timeout na {OPENAI_HTTP_TIMEOUT:.0f}s (attempt {attempt})"
+            if status_log is not None:
+                status_log.append(f"   • OpenAI timeout: {last_err}\n")
+        except requests.RequestException as e:
+            last_err = f"HTTP fout: {getattr(e.response, 'status_code', 'n/a')} {str(e)[:180]}"
+            if status_log is not None:
+                status_log.append(f"   • OpenAI HTTP-fout: {last_err}\n")
+        except Exception as e:
+            last_err = f"Onverwachte fout: {str(e)[:180]}"
+            if status_log is not None:
+                status_log.append(f"   • OpenAI fout: {last_err}\n")
+
+        if attempt < OPENAI_MAX_RETRIES:
+            sleep_s = OPENAI_BACKOFF_BASE ** (attempt - 1)
+            if status_log is not None:
+                status_log.append(f"   • Backoff {sleep_s:.1f}s…\n")
+            time.sleep(sleep_s)
+
+    raise RuntimeError(f"OpenAI mislukt na {OPENAI_MAX_RETRIES} pogingen: {last_err or 'onbekende fout'}")
 
 def split_ai_output(text: str) -> Dict[str, str]:
     lines = [l.rstrip() for l in (text or "").splitlines()]
@@ -458,7 +517,6 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
                     "score": score})
     out.sort(key=lambda x: x.get("score", 0), reverse=True)
     return out
-
 
 def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
     cache_key = store_domain
@@ -873,7 +931,13 @@ def api_optimize():
                                  "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n")
                     try:
                         yield f"→ #{pid}: AI-tekst genereren...\n"
-                        ai_raw=_openai_chat(sys_prompt, base_prompt)
+
+                        # verzamel OpenAI statusmeldingen en stuur ze na afloop door
+                        _status: List[str] = []
+                        ai_raw = _openai_chat(sys_prompt, base_prompt, status_log=_status)
+                        for line in _status:
+                            yield line
+
                         pieces=split_ai_output(ai_raw)
 
                         title_ai=enforce_title_name_map(_s(pieces.get("title")) or title)
@@ -917,12 +981,23 @@ def api_optimize():
     return Response(stream(), mimetype="text/plain", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 # =========================
-# Health
+# Health & Selftest
 # =========================
 
 @app.get("/healthz")
 def healthz():
     return "ok", 200
+
+@app.post("/api/selftest")
+@_require_login
+@require_csrf
+def api_selftest():
+    try:
+        out = _openai_chat("Je bent een korte echo-tester.", "Antwoord met exact: OK", status_log=None)
+        ok = (out or "").strip().upper().startswith("OK")
+        return jsonify({"openai_ok": bool(ok), "raw": (out or "")[:120]})
+    except Exception as e:
+        return jsonify({"openai_ok": False, "error": str(e)}), 500
 
 # =========================
 # Main
