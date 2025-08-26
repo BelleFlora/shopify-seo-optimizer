@@ -271,6 +271,7 @@ RE_BUNDLE_QTY_PREFIX = re.compile(r"^\s*(\d+)\s*[xX]\s+")
 RE_BUNDLE_MIX_HINTS  = re.compile(r"\b(mix|assorti|pakket|bundel|cadeau|geschenk|set|combi|combinatie|box)\b", re.I)
 # --- Soortherkenning & 'zekere' tuin-kennis (alleen veelvoorkomende, veilige info)
 GARDEN_KB = {
+    # soort/geslacht -> (bloeiperiode, plantperiode)
     "hydrangea": ("juni–september", "najaar (sep–nov) of vroege lente (mrt–apr)"),
     "lavandula": ("juni–augustus", "najaar (sep–okt) of lente (apr)"),
     "rosa": ("juni–oktober", "najaar (okt–nov) of vroege lente (mrt)"),
@@ -292,8 +293,9 @@ def _detect_species_key(text: str) -> Optional[str]:
 def _ensure_garden_lines(body_html: str, title_for_species: str) -> str:
     """
     Voeg <p><strong>Bloeiperiode</strong>: …</p> en/of <p><strong>Plantperiode</strong>: …</p>
-    in de sectie 'Eigenschappen & behoeften' als we de soort zeker herkennen.
-    Als de sectie niet bestaat, maken we hem aan.
+    toe wanneer:
+      - ze nog niet in de HTML staan, en
+      - we een zekere mapping hebben in GARDEN_KB.
     """
     if not body_html:
         return body_html
@@ -301,32 +303,34 @@ def _ensure_garden_lines(body_html: str, title_for_species: str) -> str:
     lower = body_html.lower()
     has_bloom = "bloeiperiode" in lower
     has_plant = "plantperiode" in lower
+
     if has_bloom and has_plant:
+        return body_html  # alles aanwezig
+
+    key = _detect_species_key(title_for_species)
+    if not key:
         return body_html
 
-    # Soort determineren op basis van titel + platte tekst van body
-    species_key = _detect_species_key((title_for_species or "").lower() + " " + _html_to_text(body_html).lower())
-    if not species_key:
+    bloom, plant = GARDEN_KB.get(key, (None, None))
+
+    # Vind de 'Eigenschappen & behoeften'-sectie
+    start_idx = lower.find("<h3>eigenschappen & behoeften</h3>")
+    if start_idx == -1:
         return body_html
 
-    bloom, plant = GARDEN_KB.get(species_key, (None, None))
-    bits = []
+    # Invoegpunt = net ná deze h3
+    insert_at = start_idx + len("<h3>eigenschappen & behoeften</h3>")
+
+    new_bits = ""
     if not has_bloom and bloom:
-        bits.append(f'<p><strong>Bloeiperiode</strong>: {bloom}</p>')
+        new_bits += f'\n<p><strong>Bloeiperiode</strong>: {bloom}</p>'
     if not has_plant and plant:
-        bits.append(f'<p><strong>Plantperiode</strong>: {plant}</p>')
-    if not bits:
+        new_bits += f'\n<p><strong>Plantperiode</strong>: {plant}</p>'
+
+    if not new_bits:
         return body_html
 
-    # Robuust de sectie-kop vinden (attribs/whitespace tolerant)
-    h3_re = re.compile(r"<h3[^>]*>\s*eigenschappen\s*&\s*behoeften\s*</h3>", re.I)
-    m = h3_re.search(body_html)
-    if m:
-        insert_at = m.end()
-        return body_html[:insert_at] + "\n" + "\n".join(bits) + body_html[insert_at:]
-    else:
-        # Sectie niet gevonden: maak hem aan aan het einde
-        return body_html.rstrip() + "\n<h3>Eigenschappen & behoeften</h3>\n" + "\n".join(bits)
+    return body_html[:insert_at] + new_bits + body_html[insert_at:]
 
 def _html_to_text(s: str) -> str:
     return re.sub(r"<[^>]+>", " ", s or "", flags=re.I)
@@ -609,58 +613,47 @@ def _set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname: 
 
 def set_product_metafields(token: str, store_domain: str, product_id: int, values: Dict[str, str]) -> Dict[str, Any]:
     """
-    Probeert metafields te zetten. Als alle bestaande definities falen,
-    dan schrijft hij altijd fallback 'specs.height_cm' en 'specs.pot_diameter_cm'
-    als single_line_text_field. Geeft een logboek terug.
+    Probeert metafields te zetten met mirroring. Als geen enkele candidate slaagt,
+    schrijft hij fallback 'specs.height_cm' / 'specs.pot_diameter_cm' als single_line_text_field.
+    Returns: {"written": [...], "errors": [...]}
     """
-    report = {"written": [], "errors": []}
+    report: Dict[str, Any] = {"written": [], "errors": []}
     if not values:
         return report
 
     mm = _ensure_meta_map(token, store_domain)
     gid = f"gid://shopify/Product/{int(product_id)}"
 
-def try_write(val: str, candidates: List[Dict[str, Any]], fallback_key: str):
-        success = False
+    def try_write(val: str, candidates: List[Dict[str, Any]], fallback_key: str, mirror_max: int):
+        wrote = 0
+        last_error = None
         for cand in candidates:
+            if wrote >= mirror_max:
+                break
             ns, key, tname = cand["namespace"], cand["key"], cand["type"]
             ok, msg = _set_one(token, store_domain, gid, ns, key, tname, val)
             if ok:
                 report["written"].append(f"{ns}.{key} [{tname}]={val}")
-                success = True
-                break
+                wrote += 1
             else:
+                last_error = msg
                 report["errors"].append(f"{ns}.{key}: {msg}")
-        if not success:
-            # fallback naar specs
+
+        if wrote == 0:
+            # fallback naar specs/fixed key
             ns = META_NAMESPACE_DEFAULT or "specs"
             ok, msg = _set_one(token, store_domain, gid, ns, fallback_key, "single_line_text_field", val)
             if ok:
-                report["written"].append(f"{ns}.{fallback_key} [fallback] = {val}")
+                report["written"].append(f"{ns}.{fallback_key} [fallback single_line_text_field]={val}")
             else:
-                report["errors"].append(f"{ns}.{fallback_key} fallback: {msg}")
+                report["errors"].append(f"{ns}.{fallback_key} fallback: {msg or last_error or 'onbekende fout'}")
 
     if values.get("height_cm"):
-        try_write(values["height_cm"], mm.get("height_candidates", []), "height_cm")
+        try_write(values["height_cm"], mm.get("height_candidates", []), "height_cm", META_MIRROR_MAX_HEIGHT)
     if values.get("pot_diameter_cm"):
-        try_write(values["pot_diameter_cm"], mm.get("diam_candidates", []), "pot_diameter_cm")
+        try_write(values["pot_diameter_cm"], mm.get("diam_candidates", []), "pot_diameter_cm", META_MIRROR_MAX_DIAM)
 
     return report
-
-
-# ===== Extra fallback: dimensies uit varianten =====
-def parse_dimensions_from_variants(prod: Dict[str, Any]) -> Dict[str, str]:
-    texts: List[str] = []
-    for v in (prod.get("variants") or []):
-        title = _s(v.get("title", ""))
-        if title: texts.append(title)
-        for k in ("option1", "option2", "option3"):
-            val = _s(v.get(k, ""))
-            if val: texts.append(val)
-    blob = " | ".join(texts)
-    if not blob:
-        return {}
-    return parse_dimensions(blob, "")
 
 # =========================
 # Auth & UI
@@ -966,6 +959,24 @@ def api_optimize():
 
     sys_prompt = _build_system_prompt(txn)
 
+    # Bepaal of er tuin-collecties zitten in de selectie (stuurt prompt-hints)
+    garden_words = {"tuinplanten","bloeiende tuinplanten","siergrassen","hagen","klimplanten","olijfbomen","moestuin"}
+    selected_titles = []
+    for coll_id in colls:
+        try:
+            r1 = _get(f"https://{store}/admin/api/2024-07/smart_collections/{coll_id}.json", token)
+            t1 = (r1.json().get("smart_collection") or {}).get("title")
+            if t1: selected_titles.append(t1.lower())
+        except Exception:
+            pass
+        try:
+            r2 = _get(f"https://{store}/admin/api/2024-07/custom_collections/{coll_id}.json", token)
+            t2 = (r2.json().get("custom_collection") or {}).get("title")
+            if t2: selected_titles.append(t2.lower())
+        except Exception:
+            pass
+    is_garden_selection = any(any(w in t for w in garden_words) for t in selected_titles)
+
     def stream():
         try:
             # Stel de te verwerken producten vast:
@@ -1014,6 +1025,16 @@ def api_optimize():
                         "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n"
                     )
 
+                    if is_garden_selection:
+                        base_prompt += (
+                            "\nVOOR TUINPLANTEN:\n"
+                            "- Voeg ONDER 'Eigenschappen & behoeften' optioneel extra regels toe (alleen als je het met hoge zekerheid weet):\n"
+                            "  <p><strong>Bloeiperiode</strong>: …</p> (bij bloeiende tuinplanten)\n"
+                            "  <p><strong>Plantperiode</strong>: …</p>\n"
+                            "- Als je het NIET zeker weet: laat de regels weg (NIET raden, geen placeholders).\n"
+                            "- Gebruik korte, duidelijke maandenreeksen (bv. 'juni–september', 'najaar (sep–nov)').\n"
+                        )
+
                     try:
                         yield f"→ #{pid}: AI-tekst genereren...\n"
                         ai_raw=_openai_chat(sys_prompt, base_prompt)
@@ -1022,29 +1043,26 @@ def api_optimize():
                         title_ai = enforce_title_name_map(_s(pieces.get("title")) or title)
                         body_ai  = _s(pieces.get("body_html")) or body
                         
-                        # 1) Dimensions from AI; fallback naar origineel en daarna varianten
+                        # 1) Dimensions from AI; fallback to original if missing
                         dims = parse_dimensions(title_ai, body_ai)
                         if not dims.get("height_cm") and not dims.get("pot_diameter_cm"):
                             dims = parse_dimensions(title, body)
-                        if not (dims.get("height_cm") and dims.get("pot_diameter_cm")):
-                            v_dims = parse_dimensions_from_variants(p)
-                            for k, v in v_dims.items():
-                                dims.setdefault(k, v)
-                        yield f"   • Dimensies gedetecteerd: {dims or '{}'}\n"
                         
                         pot_color   = extract_pot_color(title_ai, body_ai)
                         pot_present = detect_pot_presence(title_ai, body_ai)
                         
                         final_title = normalize_title(title_ai, dims, pot_color, pot_present)
                         
-                        # Keep bundle qty prefix als het een same-product bundel is
+                        # Keep bundle qty prefix if applicable (same-product bundles)
                         if qty and not re.match(r"^\s*\d+\s*[xX]\s+", final_title):
                             final_title = f"{qty}x {final_title}"
                         
-                        # 2) Garden extras (bloeiperiode/plantperiode) wanneer soort gekend
-                        final_body = _ensure_garden_lines(body_ai, final_title)
+                        # 2) Garden extras (bloeiperiode/plantperiode) when safely known
+                        final_body = body_ai
+                        if is_garden_selection:
+                            final_body = _ensure_garden_lines(final_body, final_title)
                         
-                        # 3) Inject heroicons op alle labels
+                        # 3) Inject heroicons (incl. Bloeiperiode + Plantperiode)
                         final_body = inject_heroicons(final_body)
                         
                         # SEO
@@ -1053,19 +1071,18 @@ def api_optimize():
                         
                         # Update Shopify
                         update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
+                        yield "   • Teksten & SEO bijgewerkt\n"
                         
                         # Metafields (mirror where possible)
                         missing = {}
-                        if dims.get("height_cm"):
-                            missing["height_cm"] = dims["height_cm"]
-                        if dims.get("pot_diameter_cm"):
-                            missing["pot_diameter_cm"] = dims["pot_diameter_cm"]
+                        if dims.get("height_cm"):       missing["height_cm"] = dims["height_cm"]
+                        if dims.get("pot_diameter_cm"): missing["pot_diameter_cm"] = dims["pot_diameter_cm"]
                         
                         if missing:
                             write_report = set_product_metafields(token, store, pid, missing)
-                            yield f"   • Metafields aangevuld: {missing} → {write_report}\n"
+                            yield f"   • Metafields: {missing} → {write_report}\n"
                         else:
-                            yield "   • Metafields: geen waarden gevonden\n"
+                            yield "   • Metafields: geen nieuwe waarden gevonden\n"
                         
                         total_updated += 1
                         yield f"✅ #{pid} bijgewerkt: {final_title}\n"
