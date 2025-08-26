@@ -269,9 +269,9 @@ POT_PRESENCE = [
 # --- Bundel detectie
 RE_BUNDLE_QTY_PREFIX = re.compile(r"^\s*(\d+)\s*[xX]\s+")
 RE_BUNDLE_MIX_HINTS  = re.compile(r"\b(mix|assorti|pakket|bundel|cadeau|geschenk|set|combi|combinatie|box)\b", re.I)
-# --- Soortherkenning & 'zekere' tuin-kennis (alleen veelvoorkomende, veilige info)
+
+# --- Soortherkenning & zekere tuin-kennis
 GARDEN_KB = {
-    # soort/geslacht -> (bloeiperiode, plantperiode)
     "hydrangea": ("juni–september", "najaar (sep–nov) of vroege lente (mrt–apr)"),
     "lavandula": ("juni–augustus", "najaar (sep–okt) of lente (apr)"),
     "rosa": ("juni–oktober", "najaar (okt–nov) of vroege lente (mrt)"),
@@ -291,43 +291,28 @@ def _detect_species_key(text: str) -> Optional[str]:
     return None
 
 def _ensure_garden_lines(body_html: str, title_for_species: str) -> str:
-    """
-    Voeg <p><strong>Bloeiperiode</strong>: …</p> en/of <p><strong>Plantperiode</strong>: …</p>
-    toe wanneer:
-      - ze nog niet in de HTML staan, en
-      - we een zekere mapping hebben in GARDEN_KB.
-    """
     if not body_html:
         return body_html
-
     lower = body_html.lower()
     has_bloom = "bloeiperiode" in lower
     has_plant = "plantperiode" in lower
-
     if has_bloom and has_plant:
         return body_html
-
     key = _detect_species_key(title_for_species)
     if not key:
         return body_html
-
     bloom, plant = GARDEN_KB.get(key, (None, None))
-
     start_idx = lower.find("<h3>eigenschappen & behoeften</h3>")
     if start_idx == -1:
         return body_html
-
     insert_at = start_idx + len("<h3>eigenschappen & behoeften</h3>")
-
     new_bits = ""
     if not has_bloom and bloom:
         new_bits += f'\n<p><strong>Bloeiperiode</strong>: {bloom}</p>'
     if not has_plant and plant:
         new_bits += f'\n<p><strong>Plantperiode</strong>: {plant}</p>'
-
     if not new_bits:
         return body_html
-
     return body_html[:insert_at] + new_bits + body_html[insert_at:]
 
 def _html_to_text(s: str) -> str:
@@ -370,25 +355,15 @@ def detect_pot_presence(title: str, body_html: str) -> bool:
     return any(rx.search(text) for rx in POT_PRESENCE)
 
 def analyze_bundle(title: str) -> Tuple[bool, Optional[int]]:
-    """
-    Return (skip, qty).
-    - skip=True  → vermoedelijke mix/verschillende producten -> overslaan
-    - qty=None  → geen bundel
-    - qty=int   → bundel van hetzelfde product (prefix 'N x')
-    Heuristiek: als er een '+' staat en niet gevolgd door 'pot', of duidelijke mix-woorden → skip.
-    """
     t = title or ""
     m = RE_BUNDLE_QTY_PREFIX.match(t)
     qty = int(m.group(1)) if m else None
-
     if RE_BUNDLE_MIX_HINTS.search(t):
         return True, qty
-
     if "+" in t:
         after_plus = t.split("+", 1)[1].strip().lower()
         if not after_plus.startswith("pot"):
             return True, qty
-
     return False, qty
 
 def enforce_title_name_map(title: str) -> str:
@@ -490,9 +465,7 @@ def inject_heroicons(body_html: str) -> str:
         return body_html
     if len(body_html) > 20000:
         return body_html
-
     out = body_html
-
     def add_icon(out_html: str, label: str, icon_svg: str) -> str:
         candidates = [
             f"<p><strong>{label}</strong>:", f"<p> <strong>{label}</strong>:",
@@ -504,14 +477,12 @@ def inject_heroicons(body_html: str) -> str:
             if pos != -1:
                 return out_html[:pos] + out_html[pos:].replace("<p><strong", f"<p>{icon_svg}<strong", 1)
         return out_html
-
     out = add_icon(out, "Lichtbehoefte", _icon_svg("sun"))
     out = add_icon(out, "Waterbehoefte", _icon_svg("droplet"))
     out = add_icon(out, "Standplaats",   _icon_svg("home"))
     out = add_icon(out, "Giftigheid",    _icon_svg("exclamation-triangle"))
     out = add_icon(out, "Bloeiperiode",  _icon_svg("calendar"))
     out = add_icon(out, "Plantperiode",  _icon_svg("sprout"))
-
     return out
 
 # =========================
@@ -534,6 +505,29 @@ def update_product_texts(store_domain: str, token: str, product_id: int,
     errs = (data.get("data", {}).get("productUpdate", {}) or {}).get("userErrors", [])
     if errs: raise RuntimeError(f"Shopify productUpdate: {errs}")
 
+# ---- Metafields helpers (GraphQL + REST fallback)
+
+def _metafield_type_slug(t: str) -> str:
+    """Normaliseer verschillende schrijfwijzen naar Shopify type-slugs."""
+    if not t: return "single_line_text_field"
+    tl = t.strip().lower()
+    # Veelvoorkomende vormen
+    repl = {
+        "single line text": "single_line_text_field",
+        "single_line_text": "single_line_text_field",
+        "singlelinetextfield": "single_line_text_field",
+        "number integer": "number_integer",
+        "numberinteger": "number_integer",
+        "number decimal": "number_decimal",
+        "numberdecimal": "number_decimal",
+        "dimension": "dimension",
+        "measurement_dimension": "dimension",
+        "json": "json",
+        "string": "single_line_text_field",
+        "text": "single_line_text_field",
+    }
+    return repl.get(tl, tl)
+
 def _defs_for_product(token: str, store_domain: str) -> List[Dict[str, Any]]:
     query = """
     query defs {
@@ -543,7 +537,13 @@ def _defs_for_product(token: str, store_domain: str) -> List[Dict[str, Any]]:
     }"""
     data = _post(_gql_url(store_domain), token, {"query": query})
     edges = (((data or {}).get("data") or {}).get("metafieldDefinitions") or {}).get("edges") or []
-    return [e["node"] for e in edges if "node" in e]
+    out = []
+    for e in edges:
+        node = e.get("node") or {}
+        tname = ((node.get("type") or {}).get("name")) or "single_line_text_field"
+        node["type_slug"] = _metafield_type_slug(tname)
+        out.append(node)
+    return out
 
 def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -552,18 +552,16 @@ def _rank_candidates(defs: List[Dict[str, Any]], hints: List[str]) -> List[Dict[
         name = (d.get("name") or ""); key = (d.get("key") or ""); ns = (d.get("namespace") or "")
         lname, lkey = name.lower(), key.lower()
         if not any(h in lname or h in lkey for h in hints): continue
-        tname = (((d.get("type") or {}).get("name")) or "single_line_text_field").lower()
+        tslug = d.get("type_slug","single_line_text_field")
         score = 0
-        if "number_integer" in tname: score += 30
-        elif "dimension" in tname:    score += 22
-        elif "number_decimal" in tname: score += 18
-        elif "single_line_text_field" in tname: score += 10
+        if "number_integer" in tslug: score += 30
+        elif "dimension" in tslug:    score += 22
+        elif "number_decimal" in tslug: score += 18
+        elif "single_line_text_field" in tslug: score += 10
         if lkey in ("hoogte_cm", "hoogte"): score += 50
         if lkey in ("diameter_cm", "pot_diameter_cm", "diameter"): score += 50
         if ns.lower() == "custom": score += 2
-        out.append({"namespace": ns, "key": key, "name": name,
-                    "type": (d.get("type") or {}).get("name") or "single_line_text_field",
-                    "score": score})
+        out.append({"namespace": ns, "key": key, "name": name, "type": tslug, "score": score})
     out.sort(key=lambda x: x.get("score", 0), reverse=True)
     return out
 
@@ -575,73 +573,145 @@ def _ensure_meta_map(token: str, store_domain: str) -> Dict[str, Any]:
     d = _rank_candidates(defs, META_DIAM_HINTS  or ["diameter", "pot", "ø", "⌀"])
     if not h: h = [{"namespace": META_NAMESPACE_DEFAULT, "key": "height_cm", "name": "height_cm", "type": "single_line_text_field", "score": 0}]
     if not d: d = [{"namespace": META_NAMESPACE_DEFAULT, "key": "pot_diameter_cm", "name": "pot_diameter_cm", "type": "single_line_text_field", "score": 0}]
-    mm = {"height_candidates": h, "diam_candidates": d,
-          "height_ns": h[0]["namespace"], "height_key": h[0]["key"], "height_type": h[0]["type"],
-          "diam_ns": d[0]["namespace"], "diam_key": d[0]["key"], "diam_type": d[0]["type"]}
-    _META_MAP_CACHE[cache_key] = mm; return mm
+    mm = {"height_candidates": h, "diam_candidates": d}
+    _META_MAP_CACHE[cache_key] = mm
+    return mm
 
-def _encode_value(val_str: str, tname: str) -> str:
-    t = (tname or "").lower()
+def _encode_graphql_value(val_str: str, tname_slug: str) -> str:
     try:
-        if t == "number_integer": return str(int(val_str))
-        if t == "number_decimal": return str(float(val_str))
-        if t == "dimension":      return json.dumps({"value": float(val_str), "unit": "cm"})
+        if tname_slug == "number_integer": return str(int(val_str))
+        if tname_slug == "number_decimal": return str(float(val_str))
+        if tname_slug == "dimension":      return json.dumps({"value": float(val_str), "unit": "cm"})
     except Exception:
         pass
     return str(val_str)
 
-def _set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname: str, value: str) -> Tuple[bool, str]:
+def _encode_rest_value(val_str: str, tname_slug: str) -> str:
+    if tname_slug == "dimension":
+        try:
+            return json.dumps({"value": float(val_str), "unit": "cm"})
+        except Exception:
+            return json.dumps({"value": val_str, "unit": "cm"})
+    if tname_slug == "number_integer":
+        try: return str(int(val_str))
+        except: return val_str
+    if tname_slug == "number_decimal":
+        try: return str(float(val_str))
+        except: return val_str
+    return str(val_str)
+
+def _gql_set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname_slug: str, value: str) -> Tuple[bool, str]:
     mutation = """
-    mutation setOne($metafields: [MetafieldsSetInput!]!] {
+    mutation setOne($metafields: [MetafieldsSetInput!]!) {
       metafieldsSet(metafields: $metafields) {
         metafields { namespace key type value }
         userErrors { field message }
       }
     }"""
     payload = {"query": mutation, "variables": {"metafields": [{
-        "ownerId": gid, "namespace": ns, "key": key, "type": tname, "value": _encode_value(value, tname)
+        "ownerId": gid, "namespace": ns, "key": key, "type": tname_slug, "value": _encode_graphql_value(value, tname_slug)
     }]}}
     data = _post(_gql_url(store_domain), token, payload)
     ue = (data.get("data", {}).get("metafieldsSet", {}) or {}).get("userErrors", [])
     if ue: return False, (ue[0].get("message") or str(ue))
     return True, ""
 
+def _rest_upsert_product_metafield(store_domain: str, token: str, product_id: int,
+                                   ns: str, key: str, tname_slug: str, value: str) -> Tuple[bool, str]:
+    """Create or update via REST as fallback."""
+    base = f"https://{store_domain}/admin/api/2024-07"
+    val = _encode_rest_value(value, tname_slug)
+    # 1) Try create
+    try:
+        r = REQ.post(f"{base}/products/{product_id}/metafields.json",
+                     headers=_shopify_headers(token),
+                     json={"metafield": {"namespace": ns, "key": key, "type": tname_slug, "value": val}},
+                     timeout=REQUEST_TIMEOUT)
+        if r.status_code in (200, 201):
+            return True, "created"
+        # If already exists -> 422, we will update
+        if r.status_code != 422:
+            r.raise_for_status()
+    except requests.HTTPError as e:
+        # non-422 -> propagate message in logs but continue to try update path
+        pass
+    # 2) Find existing to update
+    try:
+        gr = _get(f"{base}/products/{product_id}/metafields.json", token,
+                  params={"namespace": ns, "limit": 250})
+        items = [m for m in gr.json().get("metafields", []) if m.get("namespace")==ns and m.get("key")==key]
+        if items:
+            mid = items[0]["id"]
+            ur = REQ.put(f"{base}/metafields/{mid}.json",
+                         headers=_shopify_headers(token),
+                         json={"metafield": {"id": mid, "type": tname_slug, "value": val}},
+                         timeout=REQUEST_TIMEOUT)
+            if ur.status_code in (200, 201):
+                return True, "updated"
+            ur.raise_for_status()
+        else:
+            # second try create without product subresource (owner_* fields)
+            cr = REQ.post(f"{base}/metafields.json",
+                          headers=_shopify_headers(token),
+                          json={"metafield": {"namespace": ns, "key": key, "type": tname_slug, "value": val,
+                                              "owner_resource": "product", "owner_id": product_id}},
+                          timeout=REQUEST_TIMEOUT)
+            if cr.status_code in (200, 201):
+                return True, "created-global"
+            cr.raise_for_status()
+    except Exception as e:
+        return False, f"REST upsert error: {e}"
+    return False, "REST upsert failed"
+
 def set_product_metafields(token: str, store_domain: str, product_id: int, values: Dict[str, str]) -> Dict[str, Any]:
     """
-    Probeert metafields te zetten. Als alle bestaande definities falen,
-    schrijft hij fallback 'specs.height_cm' en 'specs.pot_diameter_cm'
-    als single_line_text_field. Returned een logboek.
+    Zet metafields via GraphQL. Als dat nergens lukt: REST fallback (create/update).
+    Geeft een rapport terug voor logging.
     """
-    report: Dict[str, Any] = {"written": [], "errors": []}
+    report: Dict[str, Any] = {"written": [], "errors": [], "fallback": []}
     if not values:
         return report
 
     mm = _ensure_meta_map(token, store_domain)
     gid = f"gid://shopify/Product/{int(product_id)}"
 
-    def try_write(val: str, candidates: List[Dict[str, Any]], fallback_key: str):
-        success = False
+    def try_graphql_then_rest(label: str, val: str, candidates: List[Dict[str, Any]], fallback_key: str):
+        # 1) GraphQL: probeer alle kandidaten
+        wrote = False
+        last_errs = []
         for cand in candidates:
-            ns, key, tname = cand["namespace"], cand["key"], cand["type"]
-            ok, msg = _set_one(token, store_domain, gid, ns, key, tname, val)
+            ns, key, tslug = cand["namespace"], cand["key"], _metafield_type_slug(cand["type"])
+            ok, msg = _gql_set_one(token, store_domain, gid, ns, key, tslug, val)
             if ok:
-                report["written"].append(f"{ns}.{key} [{tname}]={val}")
-                success = True
+                report["written"].append(f"{label}:{ns}.{key} [{tslug}]={val}")
+                wrote = True
                 break
             else:
-                report["errors"].append(f"{ns}.{key}: {msg}")
-        if not success:
-            ns = META_NAMESPACE_DEFAULT or "specs"
-            ok, msg = _set_one(token, store_domain, gid, ns, fallback_key, "single_line_text_field", val)
-            if ok:
-                report["written"].append(f"{ns}.{fallback_key} [fallback]={val}")
-            else:
-                report["errors"].append(f"{ns}.{fallback_key} fallback: {msg}")
+                last_errs.append(f"{ns}.{key} [{tslug}] → {msg}")
+        if wrote:
+            return
+
+        # 2) GraphQL fallback naar default namespace/key als niets gelukt
+        ns = META_NAMESPACE_DEFAULT or "specs"
+        # kies veilig type: integer als het een geheel getal is; anders single_line_text_field
+        tslug = "number_integer" if str(val).isdigit() else "single_line_text_field"
+        ok, msg = _gql_set_one(token, store_domain, gid, ns, fallback_key, tslug, val)
+        if ok:
+            report["written"].append(f"{label}:{ns}.{fallback_key} [fallback-{tslug}]={val}")
+            return
+        report["errors"].append(f"GQL fail {label}: {last_errs + [f'{ns}.{fallback_key} → {msg}']}")
+
+        # 3) REST ultimate fallback (create/update)
+        rok, rmsg = _rest_upsert_product_metafield(store_domain, token, product_id, ns, fallback_key, tslug, val)
+        if rok:
+            report["fallback"].append(f"{label}:{ns}.{fallback_key} [{tslug}] {rmsg}")
+        else:
+            report["errors"].append(f"REST fail {label}:{ns}.{fallback_key} [{tslug}] → {rmsg}")
 
     if values.get("height_cm"):
-        try_write(values["height_cm"], mm.get("height_candidates", []), "height_cm")
+        try_graphql_then_rest("hoogte_cm", values["height_cm"], mm.get("height_candidates", []), "height_cm")
     if values.get("pot_diameter_cm"):
-        try_write(values["pot_diameter_cm"], mm.get("diam_candidates", []), "pot_diameter_cm")
+        try_graphql_then_rest("pot_diameter_cm", values["pot_diameter_cm"], mm.get("diam_candidates", []), "pot_diameter_cm")
 
     return report
 
@@ -896,7 +966,6 @@ def api_collections():
     except Exception as e:
         return jsonify({"error": f"Collecties laden mislukt: {e}"}), 400
 
-# >>> Nieuw: producten uit geselecteerde collecties ophalen
 @app.post("/api/collection-products")
 @_require_login
 @require_csrf
@@ -909,14 +978,12 @@ def api_collection_products():
             return jsonify({"error":"Store of token ontbreekt."}), 400
         if not coll_ids:
             return jsonify([])
-
         pid_set = set()
         for cid in coll_ids:
             collects = _get(f"https://{store}/admin/api/2024-07/collects.json", token,
                             params={"collection_id": cid, "limit": 250}).json().get("collects", [])
             for c in collects:
                 pid_set.add(int(c["product_id"]))
-
         pids = sorted(pid_set)
         products: List[Dict[str, Any]] = []
         for i in range(0, len(pids), 50):
@@ -926,7 +993,6 @@ def api_collection_products():
             prods = r.json().get("products", [])
             for p in prods:
                 products.append({"id": int(p["id"]), "title": p.get("title","")})
-
         products.sort(key=lambda x: (x["title"].lower(), x["id"]))
         return jsonify(products)
     except Exception as e:
@@ -1009,7 +1075,6 @@ def api_optimize():
                         "2) Lever ‘Beschrijving’ (HTML) met vaste h3-secties en 4 regels.\n"
                         "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n"
                     )
-
                     if is_garden_selection:
                         base_prompt += (
                             "\nVOOR TUINPLANTEN:\n"
@@ -1027,48 +1092,39 @@ def api_optimize():
 
                         title_ai = enforce_title_name_map(_s(pieces.get("title")) or title)
                         body_ai  = _s(pieces.get("body_html")) or body
-                        
-                        # 1) Dimensions from AI; fallback to original if missing
+
                         dims = parse_dimensions(title_ai, body_ai)
                         if not dims.get("height_cm") and not dims.get("pot_diameter_cm"):
                             dims = parse_dimensions(title, body)
-                        
+
                         pot_color   = extract_pot_color(title_ai, body_ai)
                         pot_present = detect_pot_presence(title_ai, body_ai)
-                        
+
                         final_title = normalize_title(title_ai, dims, pot_color, pot_present)
-                        
                         if qty and not re.match(r"^\s*\d+\s*[xX]\s+", final_title):
                             final_title = f"{qty}x {final_title}"
-                        
-                        # 2) Garden extras (bloeiperiode/plantperiode) when safely known
+
                         final_body = body_ai
                         if is_garden_selection:
                             final_body = _ensure_garden_lines(final_body, final_title)
-                        
-                        # 3) Inject heroicons (incl. Bloeiperiode + Plantperiode)
                         final_body = inject_heroicons(final_body)
-                        
-                        # SEO
+
                         final_meta_title = finalize_meta_title(pieces.get("meta_title"), final_title)
                         final_meta_desc  = finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
-                        
-                        # Update Shopify
+
                         update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
-                        
-                        # Metafields (mirror where possible) + uitgebreide logging
+
+                        # Metafields
                         missing = {}
-                        if dims.get("height_cm"):
-                            missing["height_cm"] = dims["height_cm"]
-                        if dims.get("pot_diameter_cm"):
-                            missing["pot_diameter_cm"] = dims["pot_diameter_cm"]
-                        
+                        if dims.get("height_cm"):       missing["height_cm"] = dims["height_cm"]
+                        if dims.get("pot_diameter_cm"): missing["pot_diameter_cm"] = dims["pot_diameter_cm"]
+
                         if missing:
-                            write_report = set_product_metafields(token, store, pid, missing)
-                            yield f"   • Metafields aangevuld: {write_report}\n"
+                            rep = set_product_metafields(token, store, pid, missing)
+                            yield f"   • Metafields resultaat: {rep}\n"
                         else:
-                            yield "   • Metafields al aanwezig of geen waarden gevonden\n"
-                        
+                            yield "   • Metafields: geen waarden gevonden in titel/tekst\n"
+
                         total_updated += 1
                         yield f"✅ #{pid} bijgewerkt: {final_title}\n"
 
