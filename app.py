@@ -271,7 +271,6 @@ RE_BUNDLE_QTY_PREFIX = re.compile(r"^\s*(\d+)\s*[xX]\s+")
 RE_BUNDLE_MIX_HINTS  = re.compile(r"\b(mix|assorti|pakket|bundel|cadeau|geschenk|set|combi|combinatie|box)\b", re.I)
 # --- Soortherkenning & 'zekere' tuin-kennis (alleen veelvoorkomende, veilige info)
 GARDEN_KB = {
-    # soort/geslacht -> (bloeiperiode, plantperiode)
     "hydrangea": ("juni–september", "najaar (sep–nov) of vroege lente (mrt–apr)"),
     "lavandula": ("juni–augustus", "najaar (sep–okt) of lente (apr)"),
     "rosa": ("juni–oktober", "najaar (okt–nov) of vroege lente (mrt)"),
@@ -279,8 +278,8 @@ GARDEN_KB = {
     "acer palmatum": (None, "najaar (okt–nov) of vroege lente (mrt)"),
     "buxus": (None, "najaar (sep–nov) of vroege lente (mrt–apr)"),
     "olea": (None, "late lente tot zomer (mei–juni)"),
-    "lavendel": ("juni–augustus", "najaar (sep–okt) of lente (apr)"),  # NL alias
-    "hortensia": ("juni–september", "najaar (sep–nov) of vroege lente (mrt–apr)"),  # NL alias
+    "lavendel": ("juni–augustus", "najaar (sep–okt) of lente (apr)"),
+    "hortensia": ("juni–september", "najaar (sep–nov) of vroege lente (mrt–apr)"),
 }
 
 def _detect_species_key(text: str) -> Optional[str]:
@@ -291,45 +290,28 @@ def _detect_species_key(text: str) -> Optional[str]:
     return None
 
 def _ensure_garden_lines(body_html: str, title_for_species: str) -> str:
-    """
-    Voeg <p><strong>Bloeiperiode</strong>: …</p> en/of <p><strong>Plantperiode</strong>: …</p>
-    toe wanneer:
-      - ze nog niet in de HTML staan, en
-      - we een zekere mapping hebben in GARDEN_KB.
-    """
     if not body_html:
         return body_html
-
     lower = body_html.lower()
     has_bloom = "bloeiperiode" in lower
     has_plant = "plantperiode" in lower
-
     if has_bloom and has_plant:
-        return body_html  # alles aanwezig
-
+        return body_html
     key = _detect_species_key(title_for_species)
     if not key:
         return body_html
-
     bloom, plant = GARDEN_KB.get(key, (None, None))
-
-    # Vind de 'Eigenschappen & behoeften'-sectie
     start_idx = lower.find("<h3>eigenschappen & behoeften</h3>")
     if start_idx == -1:
-        return body_html  # we veranderen niets als de structuur anders is
-
-    # Invoegpunt = net ná deze h3
+        return body_html
     insert_at = start_idx + len("<h3>eigenschappen & behoeften</h3>")
-
     new_bits = ""
     if not has_bloom and bloom:
         new_bits += f'\n<p><strong>Bloeiperiode</strong>: {bloom}</p>'
     if not has_plant and plant:
         new_bits += f'\n<p><strong>Plantperiode</strong>: {plant}</p>'
-
     if not new_bits:
         return body_html
-
     return body_html[:insert_at] + new_bits + body_html[insert_at:]
 
 def _html_to_text(s: str) -> str:
@@ -359,6 +341,25 @@ def parse_dimensions(title: str, body_html: str) -> Dict[str, str]:
     if diam   is not None: out["pot_diameter_cm"] = str(diam)
     return out
 
+def parse_dimensions_from_variants(product: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Extra bron als titel/tekst niets oplevert: kijk naar varianten.
+    Haal alle '... cm' getallen uit variant-titels en optievelden.
+    """
+    nums: List[int] = []
+    for v in (product.get("variants") or []):
+        fields = [v.get("title",""), v.get("option1",""), v.get("option2",""), v.get("option3","")]
+        blob = " | ".join([_s(x) for x in fields])
+        nums += [int(n) for n in RE_CM_ALL.findall(blob)]
+    nums = sorted(set(nums))
+    out: Dict[str, str] = {}
+    if len(nums) >= 2:
+        out["height_cm"] = str(max(nums))
+        out["pot_diameter_cm"] = str(min(nums))
+    elif len(nums) == 1:
+        out["height_cm"] = str(nums[0])
+    return out
+
 def extract_pot_color(title: str, body_html: str) -> Optional[str]:
     text = f"{title or ''}\n{_html_to_text(body_html)}"
     for rx in (RE_IN_COLOR_POT, RE_COLOR_POT, RE_POT_COLOR):
@@ -372,25 +373,15 @@ def detect_pot_presence(title: str, body_html: str) -> bool:
     return any(rx.search(text) for rx in POT_PRESENCE)
 
 def analyze_bundle(title: str) -> Tuple[bool, Optional[int]]:
-    """
-    Return (skip, qty).
-    - skip=True  → vermoedelijke mix/verschillende producten -> overslaan
-    - qty=None  → geen bundel
-    - qty=int   → bundel van hetzelfde product (prefix 'N x')
-    Heuristiek: als er een '+' staat en niet gevolgd door 'pot', of duidelijke mix-woorden → skip.
-    """
     t = title or ""
     m = RE_BUNDLE_QTY_PREFIX.match(t)
     qty = int(m.group(1)) if m else None
-
     if RE_BUNDLE_MIX_HINTS.search(t):
         return True, qty
-
     if "+" in t:
         after_plus = t.split("+", 1)[1].strip().lower()
         if not after_plus.startswith("pot"):
             return True, qty
-
     return False, qty
 
 def enforce_title_name_map(title: str) -> str:
@@ -456,7 +447,6 @@ def _icon_svg(name: str) -> str:
   <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"></line>
 </svg>'''
     if name == "droplet":
-        # duidelijke contour → zichtbaar in Shopify editor
         return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
   <path d="M12 2.8C9.2 6 6 9.9 6 13.2a6 6 0 1 0 12 0c0-3.3-3.2-7.2-6-10.4z" fill="none"></path>
 </svg>'''
@@ -487,20 +477,15 @@ def _icon_svg(name: str) -> str:
     return _icon_svg("droplet")
 
 def inject_heroicons(body_html: str) -> str:
-    """
-    Robuuste, snelle injectie. Nieuwe labels: Bloeiperiode (calendar), Plantperiode (sprout).
-    """
     if not body_html:
         return body_html
     if 'class="bf-icon"' in body_html or 'data-heroicon=' in body_html:
         return body_html
     if len(body_html) > 20000:
         return body_html
-
     out = body_html
 
     def add_icon(out_html: str, label: str, icon_svg: str) -> str:
-        # probeer meerdere varianten van het label te matchen
         candidates = [
             f"<p><strong>{label}</strong>:", f"<p> <strong>{label}</strong>:",
             f"<p><strong>{label}</strong> :", f"<p>{label}:", f"<p> {label}:",
@@ -509,7 +494,6 @@ def inject_heroicons(body_html: str) -> str:
         for pat in candidates:
             pos = out_html.lower().find(pat.lower())
             if pos != -1:
-                # zet icoon vóór <strong>
                 return out_html[:pos] + out_html[pos:].replace("<p><strong", f"<p>{icon_svg}<strong", 1)
         return out_html
 
@@ -519,7 +503,6 @@ def inject_heroicons(body_html: str) -> str:
     out = add_icon(out, "Giftigheid",    _icon_svg("exclamation-triangle"))
     out = add_icon(out, "Bloeiperiode",  _icon_svg("calendar"))
     out = add_icon(out, "Plantperiode",  _icon_svg("sprout"))
-
     return out
 
 # =========================
@@ -950,7 +933,6 @@ def api_optimize():
     # Bepaal of er tuin-collecties zitten in de selectie (stuurt prompt-hints)
     garden_words = {"tuinplanten","bloeiende tuinplanten","siergrassen","hagen","klimplanten","olijfbomen","moestuin"}
     selected_titles = []
-    # Probeer smart + custom; fouten negeren (id kan van ander type zijn)
     for coll_id in colls:
         try:
             r1 = _get(f"https://{store}/admin/api/2024-07/smart_collections/{coll_id}.json", token)
@@ -968,13 +950,11 @@ def api_optimize():
 
     def stream():
         try:
-            # Stel de te verwerken producten vast:
             pid_list: List[int] = []
             if explicit_pids:
                 pid_list = [int(x) for x in explicit_pids]
                 yield f"{len(pid_list)} expliciet geselecteerde producten ontvangen.\n"
             else:
-                # uit collecties halen
                 pid_set = set()
                 for coll_id in colls:
                     url=f"https://{store}/admin/api/2024-07/collects.json"
@@ -989,7 +969,6 @@ def api_optimize():
                 yield "Niets te doen (lege selectie).\n"
                 return
 
-            # chunken naar /products.json batches
             for i in range(0, len(pid_list), 50):
                 batch_ids = pid_list[i:i+50]
                 r=_get(f"https://{store}/admin/api/2024-07/products.json", token,
@@ -1000,7 +979,6 @@ def api_optimize():
                     title=_s(p.get("title",""))
                     body=_s(p.get("body_html",""))
 
-                    # Bundel analyse (skip bij mix, qty prefix bewaren)
                     skip_bundle, qty = analyze_bundle(title)
                     if skip_bundle:
                         yield f"⏭️ #{pid}: overgeslagen (bundel met verschillende producten)\n"
@@ -1014,14 +992,13 @@ def api_optimize():
                         "2) Lever ‘Beschrijving’ (HTML) met vaste h3-secties en 4 regels.\n"
                         "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n"
                     )
-
                     if is_garden_selection:
                         base_prompt += (
                             "\nVOOR TUINPLANTEN:\n"
                             "- Voeg ONDER 'Eigenschappen & behoeften' optioneel extra regels toe (alleen als je het met hoge zekerheid weet):\n"
-                            "  <p><strong>Bloeiperiode</strong>: …</p> (bij bloeiende tuinplanten)\n"
+                            "  <p><strong>Bloeiperiode</strong>: …</p>\n"
                             "  <p><strong>Plantperiode</strong>: …</p>\n"
-                            "- Als je het NIET zeker weet: laat de regels weg (NIET raden, geen placeholders).\n"
+                            "- Als je het NIET zeker weet: laat de regels weg (NIET raden).\n"
                             "- Gebruik korte, duidelijke maandenreeksen (bv. 'juni–september', 'najaar (sep–nov)').\n"
                         )
 
@@ -1032,57 +1009,40 @@ def api_optimize():
 
                         title_ai = enforce_title_name_map(_s(pieces.get("title")) or title)
                         body_ai  = _s(pieces.get("body_html")) or body
-                        
-                        # 1) Dimensions from AI; fallback to original if missing
+
+                        # 1) Afmetingen – AI → originele content → varianten
                         dims = parse_dimensions(title_ai, body_ai)
                         if not dims.get("height_cm") and not dims.get("pot_diameter_cm"):
-                            dims = parse_dimensions(title, body)  # <-- fixed indent
-                        
+                            dims = parse_dimensions(title, body)  # fixed indent (actieve fallback)
+                        if not dims.get("height_cm") and not dims.get("pot_diameter_cm"):
+                            dims = parse_dimensions_from_variants(p)
+
                         pot_color   = extract_pot_color(title_ai, body_ai)
                         pot_present = detect_pot_presence(title_ai, body_ai)
-                        
+
                         final_title = normalize_title(title_ai, dims, pot_color, pot_present)
-                        
-                        # Keep bundle qty prefix if applicable (same-product bundles)
                         if qty and not re.match(r"^\s*\d+\s*[xX]\s+", final_title):
                             final_title = f"{qty}x {final_title}"
-                        
-                        # 2) Garden extras (bloeiperiode/plantperiode) when safely known
+
+                        # 2) Tuin-info (veilig bekende bloei/plantperiode)
                         final_body = body_ai
                         if is_garden_selection:
                             final_body = _ensure_garden_lines(final_body, final_title)
-                        
-                        # 3) Inject heroicons (incl. Bloeiperiode + Plantperiode)
+
+                        # 3) Heroicons injecteren
                         final_body = inject_heroicons(final_body)
-                        
-                        # SEO
+
                         final_meta_title = finalize_meta_title(pieces.get("meta_title"), final_title)
                         final_meta_desc  = finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
-                        
-                        # Update Shopify
+
                         update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
-                        
-                        # Metafields (mirror where possible)
+
+                        # Metafields op product
                         missing = {}
-                        if dims.get("height_cm"):
-                            missing["height_cm"] = dims["height_cm"]
-                        if dims.get("pot_diameter_cm"):
-                            missing["pot_diameter_cm"] = dims["pot_diameter_cm"]
-                        
+                        if dims.get("height_cm"):        missing["height_cm"] = dims["height_cm"]
+                        if dims.get("pot_diameter_cm"):  missing["pot_diameter_cm"] = dims["pot_diameter_cm"]
                         if missing:
                             w = set_product_metafields(token, store, pid, missing)
-                            yield f"   • Metafields aangevuld: {missing} → {w}\n"
-                        else:
-                            yield "   • Metafields al aanwezig of geen waarden gevonden\n"
-                        
-                        total_updated += 1
-                        yield f"✅ #{pid} bijgewerkt: {final_title}\n"
-
-                        missing={}
-                        if dims.get("height_cm"):       missing["height_cm"]=dims["height_cm"]
-                        if dims.get("pot_diameter_cm"): missing["pot_diameter_cm"]=dims["pot_diameter_cm"]
-                        if missing:
-                            w=set_product_metafields(token, store, pid, missing)
                             yield f"   • Metafields aangevuld: {missing} → {w}\n"
                         else:
                             yield "   • Metafields al aanwezig of geen waarden gevonden\n"
