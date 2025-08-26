@@ -1028,47 +1028,55 @@ def api_optimize():
                     try:
                         yield f"→ #{pid}: AI-tekst genereren...\n"
                         ai_raw=_openai_chat(sys_prompt, base_prompt)
-                        pieces=split_ai_output(ai_raw)
+                        pieces = split_ai_output(ai_raw)
 
                         title_ai = enforce_title_name_map(_s(pieces.get("title")) or title)
                         body_ai  = _s(pieces.get("body_html")) or body
-
-                        # 1) Afmetingen uit AI-tekst
+                        
+                        # 1) Dimensions from AI; fallback to original if missing
                         dims = parse_dimensions(title_ai, body_ai)
-                        #    Fallback: probeer originele data als AI niets gaf
                         if not dims.get("height_cm") and not dims.get("pot_diameter_cm"):
-                        dims = parse_dimensions(title, body)
-
+                            dims = parse_dimensions(title, body)  # <-- fixed indent
+                        
                         pot_color   = extract_pot_color(title_ai, body_ai)
                         pot_present = detect_pot_presence(title_ai, body_ai)
-
+                        
                         final_title = normalize_title(title_ai, dims, pot_color, pot_present)
-
-                        # bundel-qty prefix behouden
+                        
+                        # Keep bundle qty prefix if applicable (same-product bundles)
                         if qty and not re.match(r"^\s*\d+\s*[xX]\s+", final_title):
                             final_title = f"{qty}x {final_title}"
-
-                        # 2) Tuin-info (bloeiperiode/plantperiode) indien veilig te bepalen
+                        
+                        # 2) Garden extras (bloeiperiode/plantperiode) when safely known
                         final_body = body_ai
                         if is_garden_selection:
                             final_body = _ensure_garden_lines(final_body, final_title)
-
-                        # 3) Heroicons op alle labels
+                        
+                        # 3) Inject heroicons (incl. Bloeiperiode + Plantperiode)
                         final_body = inject_heroicons(final_body)
-
-
-                        # bundel-qty prefix behouden
-                        if qty and not re.match(r"^\s*\d+\s*[xX]\s+", final_title):
-                            final_title = f"{qty}x {final_title}"
-
-                        yield "   • Iconen injecteren…\n"
-                        final_body = inject_heroicons(body_ai)
-                        yield "   • Iconen klaar\n"
-
-                        final_meta_title=finalize_meta_title(pieces.get("meta_title"), final_title)
-                        final_meta_desc =finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
-
+                        
+                        # SEO
+                        final_meta_title = finalize_meta_title(pieces.get("meta_title"), final_title)
+                        final_meta_desc  = finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
+                        
+                        # Update Shopify
                         update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
+                        
+                        # Metafields (mirror where possible)
+                        missing = {}
+                        if dims.get("height_cm"):
+                            missing["height_cm"] = dims["height_cm"]
+                        if dims.get("pot_diameter_cm"):
+                            missing["pot_diameter_cm"] = dims["pot_diameter_cm"]
+                        
+                        if missing:
+                            w = set_product_metafields(token, store, pid, missing)
+                            yield f"   • Metafields aangevuld: {missing} → {w}\n"
+                        else:
+                            yield "   • Metafields al aanwezig of geen waarden gevonden\n"
+                        
+                        total_updated += 1
+                        yield f"✅ #{pid} bijgewerkt: {final_title}\n"
 
                         missing={}
                         if dims.get("height_cm"):       missing["height_cm"]=dims["height_cm"]
