@@ -607,34 +607,46 @@ def _set_one(token: str, store_domain: str, gid: str, ns: str, key: str, tname: 
     if ue: return False, (ue[0].get("message") or str(ue))
     return True, ""
 
-def set_product_metafields(token: str, store_domain: str, product_id: int, values: Dict[str, str]) -> Dict[str, List[str]]:
-    if not values: return {"height": [], "diam": []}
+def set_product_metafields(token: str, store_domain: str, product_id: int, values: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Probeert metafields te zetten. Als alle bestaande definities falen,
+    dan schrijft hij altijd fallback 'specs.height_cm' en 'specs.pot_diameter_cm'
+    als single_line_text_field. Geeft een logboek terug.
+    """
+    report = {"written": [], "errors": []}
+    if not values:
+        return report
+
     mm = _ensure_meta_map(token, store_domain)
     gid = f"gid://shopify/Product/{int(product_id)}"
-    written = {"height": [], "diam": []}
+
+def try_write(val: str, candidates: List[Dict[str, Any]], fallback_key: str):
+        success = False
+        for cand in candidates:
+            ns, key, tname = cand["namespace"], cand["key"], cand["type"]
+            ok, msg = _set_one(token, store_domain, gid, ns, key, tname, val)
+            if ok:
+                report["written"].append(f"{ns}.{key} [{tname}]={val}")
+                success = True
+                break
+            else:
+                report["errors"].append(f"{ns}.{key}: {msg}")
+        if not success:
+            # fallback naar specs
+            ns = META_NAMESPACE_DEFAULT or "specs"
+            ok, msg = _set_one(token, store_domain, gid, ns, fallback_key, "single_line_text_field", val)
+            if ok:
+                report["written"].append(f"{ns}.{fallback_key} [fallback] = {val}")
+            else:
+                report["errors"].append(f"{ns}.{fallback_key} fallback: {msg}")
+
     if values.get("height_cm"):
-        left = META_MIRROR_MAX_HEIGHT
-        for cand in mm["height_candidates"]:
-            ok, msg = _set_one(token, store_domain, gid, cand["namespace"], cand["key"], cand["type"], values["height_cm"])
-            if ok:
-                written["height"].append(f"{cand['namespace']}.{cand['key']} [{cand['type']}]"); left -= 1
-                if left <= 0: break
-            elif "Owner subtype does not match" in msg:
-                continue
-            else:
-                raise RuntimeError(f"metafieldsSet (hoogte): {msg}")
+        try_write(values["height_cm"], mm.get("height_candidates", []), "height_cm")
     if values.get("pot_diameter_cm"):
-        left = META_MIRROR_MAX_DIAM
-        for cand in mm["diam_candidates"]:
-            ok, msg = _set_one(token, store_domain, gid, cand["namespace"], cand["key"], cand["type"], values["pot_diameter_cm"])
-            if ok:
-                written["diam"].append(f"{cand['namespace']}.{cand['key']} [{cand['type']}]"); left -= 1
-                if left <= 0: break
-            elif "Owner subtype does not match" in msg:
-                continue
-            else:
-                raise RuntimeError(f"metafieldsSet (diameter): {msg}")
-    return written
+        try_write(values["pot_diameter_cm"], mm.get("diam_candidates", []), "pot_diameter_cm")
+
+    return report
+
 
 # ===== Extra fallback: dimensies uit varianten =====
 def parse_dimensions_from_variants(prod: Dict[str, Any]) -> Dict[str, str]:
