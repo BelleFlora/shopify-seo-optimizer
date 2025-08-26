@@ -269,6 +269,68 @@ POT_PRESENCE = [
 # --- Bundel detectie
 RE_BUNDLE_QTY_PREFIX = re.compile(r"^\s*(\d+)\s*[xX]\s+")
 RE_BUNDLE_MIX_HINTS  = re.compile(r"\b(mix|assorti|pakket|bundel|cadeau|geschenk|set|combi|combinatie|box)\b", re.I)
+# --- Soortherkenning & 'zekere' tuin-kennis (alleen veelvoorkomende, veilige info)
+GARDEN_KB = {
+    # soort/geslacht -> (bloeiperiode, plantperiode)
+    "hydrangea": ("juni–september", "najaar (sep–nov) of vroege lente (mrt–apr)"),
+    "lavandula": ("juni–augustus", "najaar (sep–okt) of lente (apr)"),
+    "rosa": ("juni–oktober", "najaar (okt–nov) of vroege lente (mrt)"),
+    "helleborus": ("december–maart", "najaar (sep–okt)"),
+    "acer palmatum": (None, "najaar (okt–nov) of vroege lente (mrt)"),
+    "buxus": (None, "najaar (sep–nov) of vroege lente (mrt–apr)"),
+    "olea": (None, "late lente tot zomer (mei–juni)"),
+    "lavendel": ("juni–augustus", "najaar (sep–okt) of lente (apr)"),  # NL alias
+    "hortensia": ("juni–september", "najaar (sep–nov) of vroege lente (mrt–apr)"),  # NL alias
+}
+
+def _detect_species_key(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    for key in GARDEN_KB.keys():
+        if key in t:
+            return key
+    return None
+
+def _ensure_garden_lines(body_html: str, title_for_species: str) -> str:
+    """
+    Voeg <p><strong>Bloeiperiode</strong>: …</p> en/of <p><strong>Plantperiode</strong>: …</p>
+    toe wanneer:
+      - ze nog niet in de HTML staan, en
+      - we een zekere mapping hebben in GARDEN_KB.
+    """
+    if not body_html:
+        return body_html
+
+    lower = body_html.lower()
+    has_bloom = "bloeiperiode" in lower
+    has_plant = "plantperiode" in lower
+
+    if has_bloom and has_plant:
+        return body_html  # alles aanwezig
+
+    key = _detect_species_key(title_for_species)
+    if not key:
+        return body_html
+
+    bloom, plant = GARDEN_KB.get(key, (None, None))
+
+    # Vind de 'Eigenschappen & behoeften'-sectie
+    start_idx = lower.find("<h3>eigenschappen & behoeften</h3>")
+    if start_idx == -1:
+        return body_html  # we veranderen niets als de structuur anders is
+
+    # Invoegpunt = net ná deze h3
+    insert_at = start_idx + len("<h3>eigenschappen & behoeften</h3>")
+
+    new_bits = ""
+    if not has_bloom and bloom:
+        new_bits += f'\n<p><strong>Bloeiperiode</strong>: {bloom}</p>'
+    if not has_plant and plant:
+        new_bits += f'\n<p><strong>Plantperiode</strong>: {plant}</p>'
+
+    if not new_bits:
+        return body_html
+
+    return body_html[:insert_at] + new_bits + body_html[insert_at:]
 
 def _html_to_text(s: str) -> str:
     return re.sub(r"<[^>]+>", " ", s or "", flags=re.I)
@@ -426,7 +488,7 @@ def _icon_svg(name: str) -> str:
 
 def inject_heroicons(body_html: str) -> str:
     """
-    Robuuste, snelle injectie (regex-arm). Nieuwe labels: Bloeiperiode (calendar), Plantperiode (sprout).
+    Robuuste, snelle injectie. Nieuwe labels: Bloeiperiode (calendar), Plantperiode (sprout).
     """
     if not body_html:
         return body_html
@@ -438,21 +500,17 @@ def inject_heroicons(body_html: str) -> str:
     out = body_html
 
     def add_icon(out_html: str, label: str, icon_svg: str) -> str:
-        patterns = [
+        # probeer meerdere varianten van het label te matchen
+        candidates = [
             f"<p><strong>{label}</strong>:", f"<p> <strong>{label}</strong>:",
             f"<p><strong>{label}</strong> :", f"<p>{label}:", f"<p> {label}:",
             f"<p><strong>{label}</strong>&nbsp;:", f"<p>{label}&nbsp;:"
         ]
-        for pat in patterns:
-            idx = out_html.find(pat)
-            if idx != -1:
-                return out_html.replace(pat, f"<p>{icon_svg}<strong>{label}</strong>:", 1)
-
-        needle = f"<p><strong>{label}</strong>"
-        idx = out_html.lower().find(needle.lower())
-        if idx != -1:
-            return out_html.replace("<p><strong", f"<p>{icon_svg}<strong", 1)
-
+        for pat in candidates:
+            pos = out_html.lower().find(pat.lower())
+            if pos != -1:
+                # zet icoon vóór <strong>
+                return out_html[:pos] + out_html[pos:].replace("<p><strong", f"<p>{icon_svg}<strong", 1)
         return out_html
 
     out = add_icon(out, "Lichtbehoefte", _icon_svg("sun"))
@@ -959,11 +1017,12 @@ def api_optimize():
 
                     if is_garden_selection:
                         base_prompt += (
-                            "\nVOOR TUINPLANTEN (alleen opnemen als betrouwbaar/relevant):\n"
-                            "- Voeg extra regels toe onder ‘Eigenschappen & behoeften’:\n"
+                            "\nVOOR TUINPLANTEN:\n"
+                            "- Voeg ONDER 'Eigenschappen & behoeften' optioneel extra regels toe (alleen als je het met hoge zekerheid weet):\n"
                             "  <p><strong>Bloeiperiode</strong>: …</p> (bij bloeiende tuinplanten)\n"
                             "  <p><strong>Plantperiode</strong>: …</p>\n"
-                            "Schrijf niets als je het niet met hoge zekerheid weet.\n"
+                            "- Als je het NIET zeker weet: laat de regels weg (NIET raden, geen placeholders).\n"
+                            "- Gebruik korte, duidelijke maandenreeksen (bv. 'juni–september', 'najaar (sep–nov)').\n"
                         )
 
                     try:
@@ -971,14 +1030,32 @@ def api_optimize():
                         ai_raw=_openai_chat(sys_prompt, base_prompt)
                         pieces=split_ai_output(ai_raw)
 
-                        title_ai=enforce_title_name_map(_s(pieces.get("title")) or title)
-                        body_ai=_s(pieces.get("body_html")) or body
+                        title_ai = enforce_title_name_map(_s(pieces.get("title")) or title)
+                        body_ai  = _s(pieces.get("body_html")) or body
 
-                        dims=parse_dimensions(title_ai, body_ai)
-                        pot_color=extract_pot_color(title_ai, body_ai)
-                        pot_present=detect_pot_presence(title_ai, body_ai)
+                        # 1) Afmetingen uit AI-tekst
+                        dims = parse_dimensions(title_ai, body_ai)
+                        #    Fallback: probeer originele data als AI niets gaf
+                        if not dims.get("height_cm") and not dims.get("pot_diameter_cm"):
+                        dims = parse_dimensions(title, body)
 
-                        final_title=normalize_title(title_ai, dims, pot_color, pot_present)
+                        pot_color   = extract_pot_color(title_ai, body_ai)
+                        pot_present = detect_pot_presence(title_ai, body_ai)
+
+                        final_title = normalize_title(title_ai, dims, pot_color, pot_present)
+
+                        # bundel-qty prefix behouden
+                        if qty and not re.match(r"^\s*\d+\s*[xX]\s+", final_title):
+                            final_title = f"{qty}x {final_title}"
+
+                        # 2) Tuin-info (bloeiperiode/plantperiode) indien veilig te bepalen
+                        final_body = body_ai
+                        if is_garden_selection:
+                            final_body = _ensure_garden_lines(final_body, final_title)
+
+                        # 3) Heroicons op alle labels
+                        final_body = inject_heroicons(final_body)
+
 
                         # bundel-qty prefix behouden
                         if qty and not re.match(r"^\s*\d+\s*[xX]\s+", final_title):
