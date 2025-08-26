@@ -1,4 +1,4 @@
-# app.py — Belle Flora SEO Optimizer (sessie-creds + CSRF + producten per collectie selecteren + robuuste Shopify logging)
+# app.py — Belle Flora SEO Optimizer (sessie-creds + CSRF + producten per collectie selecteren + bundels + garden hints + heroicons)
 import os, re, json, time, html, secrets
 from typing import Any, Dict, List, Optional, Tuple
 from functools import wraps
@@ -32,8 +32,7 @@ OPENAI_RETRIES   = int(os.environ.get("OPENAI_MAX_RETRIES", "4"))
 
 DELAY_PER_PRODUCT  = float(os.environ.get("DELAY_SECONDS", "0.8"))
 SHOPIFY_RETRIES    = int(os.environ.get("SHOPIFY_MAX_RETRIES", "4"))
-# ↓ kortere default timeout zodat we niet ‘stil’ hangen op netwerkproblemen
-REQUEST_TIMEOUT    = int(os.environ.get("REQUEST_TIMEOUT", "20"))
+REQUEST_TIMEOUT    = int(os.environ.get("REQUEST_TIMEOUT", "60"))
 
 BRAND_NAME       = os.environ.get("BRAND_NAME", "Belle Flora").strip()
 META_SUFFIX      = f" | {BRAND_NAME}"
@@ -117,56 +116,20 @@ def _shopify_headers(token: str) -> Dict[str, str]:
     return {"X-Shopify-Access-Token": token, "Content-Type": "application/json", "Accept": "application/json"}
 
 def _get(url: str, token: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-    # Debug log (zonder token)
-    try:
-        print(f"[HTTP GET] {url} params={params or {}} timeout={REQUEST_TIMEOUT}s")
-    except Exception:
-        pass
-    last_exc = None
     for i in range(SHOPIFY_RETRIES):
-        try:
-            r = REQ.get(url, headers=_shopify_headers(token), params=params or {}, timeout=REQUEST_TIMEOUT)
-            if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
-                retry = float(r.headers.get("Retry-After", 2 ** i))
-                print(f"[HTTP GET] 429 rate limited, retry in {retry}s")
-                time.sleep(retry); continue
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_exc = e
-            print(f"[HTTP GET] attempt {i+1}/{SHOPIFY_RETRIES} failed: {e}")
-            if i < SHOPIFY_RETRIES - 1:
-                time.sleep(2 ** i)
-    # Laatste raise
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("HTTP GET unknown failure")
+        r = REQ.get(url, headers=_shopify_headers(token), params=params or {}, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
+            time.sleep(float(r.headers.get("Retry-After", 2 ** i))); continue
+        r.raise_for_status(); return r
+    r.raise_for_status(); return r
 
 def _post(url: str, token: str, json_body: Dict[str, Any]) -> Dict[str, Any]:
-    # Debug log (zonder token, toont geen volledige body om ruis te beperken)
-    try:
-        short = {k: ("<omitted>" if k in ("variables", "query") else v) for k, v in (json_body or {}).items()}
-        print(f"[HTTP POST] {url} body_keys={list(json_body.keys())} timeout={REQUEST_TIMEOUT}s short={short}")
-    except Exception:
-        pass
-    last_exc = None
     for i in range(SHOPIFY_RETRIES):
-        try:
-            r = REQ.post(url, headers=_shopify_headers(token), json=json_body, timeout=REQUEST_TIMEOUT)
-            if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
-                retry = float(r.headers.get("Retry-After", 2 ** i))
-                print(f"[HTTP POST] 429 rate limited, retry in {retry}s")
-                time.sleep(retry); continue
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_exc = e
-            print(f"[HTTP POST] attempt {i+1}/{SHOPIFY_RETRIES} failed: {e}")
-            if i < SHOPIFY_RETRIES - 1:
-                time.sleep(2 ** i)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("HTTP POST unknown failure")
+        r = REQ.post(url, headers=_shopify_headers(token), json=json_body, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 429 and i < SHOPIFY_RETRIES - 1:
+            time.sleep(float(r.headers.get("Retry-After", 2 ** i))); continue
+        r.raise_for_status(); return r.json()
+    r.raise_for_status(); return r.json()
 
 def _gql_url(store_domain: str) -> str:
     return f"https://{store_domain}/admin/api/2025-01/graphql.json"
@@ -227,21 +190,14 @@ def _openai_chat(sys_prompt: str, user_prompt: str) -> str:
     body = {"model": OPENAI_MODEL, "temperature": OPENAI_TEMP,
             "messages": [{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}]}
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    last_exc = None
     for i in range(OPENAI_RETRIES):
-        try:
-            r = REQ.post(url, headers=headers, json=body, timeout=120)
-            if r.status_code == 429 and i < OPENAI_RETRIES - 1:
-                time.sleep(2 ** i); continue
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            last_exc = e
-            if i < OPENAI_RETRIES - 1:
-                time.sleep(2 ** i)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("OpenAI unknown failure")
+        r = REQ.post(url, headers=headers, json=body, timeout=120)
+        if r.status_code == 429 and i < OPENAI_RETRIES - 1:
+            time.sleep(2 ** i); continue
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    r.raise_for_status()
+    return ""
 
 def split_ai_output(text: str) -> Dict[str, str]:
     lines = [l.rstrip() for l in (text or "").splitlines()]
@@ -310,6 +266,10 @@ POT_PRESENCE = [
     re.compile(r"\bplanter\b", re.I),
 ]
 
+# --- Bundel detectie
+RE_BUNDLE_QTY_PREFIX = re.compile(r"^\s*(\d+)\s*[xX]\s+")
+RE_BUNDLE_MIX_HINTS  = re.compile(r"\b(mix|assorti|pakket|bundel|cadeau|geschenk|set|combi|combinatie|box)\b", re.I)
+
 def _html_to_text(s: str) -> str:
     return re.sub(r"<[^>]+>", " ", s or "", flags=re.I)
 
@@ -348,6 +308,28 @@ def detect_pot_presence(title: str, body_html: str) -> bool:
     if extract_pot_color(title, body_html): return True
     text = f"{title or ''}\n{_html_to_text(body_html)}"
     return any(rx.search(text) for rx in POT_PRESENCE)
+
+def analyze_bundle(title: str) -> Tuple[bool, Optional[int]]:
+    """
+    Return (skip, qty).
+    - skip=True  → vermoedelijke mix/verschillende producten -> overslaan
+    - qty=None  → geen bundel
+    - qty=int   → bundel van hetzelfde product (prefix 'N x')
+    Heuristiek: als er een '+' staat en niet gevolgd door 'pot', of duidelijke mix-woorden → skip.
+    """
+    t = title or ""
+    m = RE_BUNDLE_QTY_PREFIX.match(t)
+    qty = int(m.group(1)) if m else None
+
+    if RE_BUNDLE_MIX_HINTS.search(t):
+        return True, qty
+
+    if "+" in t:
+        after_plus = t.split("+", 1)[1].strip().lower()
+        if not after_plus.startswith("pot"):
+            return True, qty
+
+    return False, qty
 
 def enforce_title_name_map(title: str) -> str:
     for nl, lat in NAME_MAP.items():
@@ -412,13 +394,14 @@ def _icon_svg(name: str) -> str:
   <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"></line>
 </svg>'''
     if name == "droplet":
+        # duidelijke contour → zichtbaar in Shopify editor
         return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
-  <path d="M12 2.5c-3 3.2-6.5 7.1-6.5 10.5a6.5 6.5 0 1 0 13 0c0-3.4-3.5-7.3-6.5-10.5z"></path>
+  <path d="M12 2.8C9.2 6 6 9.9 6 13.2a6 6 0 1 0 12 0c0-3.3-3.2-7.2-6-10.4z" fill="none"></path>
 </svg>'''
     if name == "home":
         return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
   <path d="M3 11.5l9-7 9 7"></path>
-  <path d="M5.5 10.5V20a1.5 1.5 0 0 0 1.5 1.5H9.5V15h5v6.5H17A1.5 1.5 0 0 0 18.5 20V10.5"></path>
+  <path d="M5.5 10.8V20a1.2 1.2 0 0 0 1.2 1.2H10v-6h4v6h3.3A1.2 1.2 0 0 0 18.5 20v-9.2"></path>
 </svg>'''
     if name == "exclamation-triangle":
         return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
@@ -426,49 +409,58 @@ def _icon_svg(name: str) -> str:
   <line x1="12" y1="8" x2="12" y2="13"></line>
   <circle cx="12" cy="16.5" r="1"></circle>
 </svg>'''
+    if name == "calendar":
+        return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
+  <rect x="3" y="5" width="18" height="16" rx="2" ry="2"></rect>
+  <line x1="8" y1="3" x2="8" y2="7"></line>
+  <line x1="16" y1="3" x2="16" y2="7"></line>
+  <line x1="3" y1="10" x2="21" y2="10"></line>
+</svg>'''
+    if name == "sprout":
+        return f'''<svg {_svg_attrs(name)} xmlns="http://www.w3.org/2000/svg">
+  <path d="M12 21V12"></path>
+  <path d="M12 12c0-3 2.5-5 6-5 0 3-2.5 5-6 5z"></path>
+  <path d="M12 12c0-3-2.5-5-6-5 0 3 2.5 5 6 5z"></path>
+</svg>'''
     return _icon_svg("droplet")
 
 def inject_heroicons(body_html: str) -> str:
     """
-    Veilige, snelle injectie zonder zware regex.
-    We dekken de meest voorkomende varianten af door directe string-replacements.
-    Als er al een bf-icon aanwezig is, doen we niets.
+    Robuuste, snelle injectie (regex-arm). Nieuwe labels: Bloeiperiode (calendar), Plantperiode (sprout).
     """
     if not body_html:
         return body_html
     if 'class="bf-icon"' in body_html or 'data-heroicon=' in body_html:
         return body_html
-
-    # Heel grote HTML? Sla icon-injectie over om performance te garanderen.
     if len(body_html) > 20000:
         return body_html
 
     out = body_html
 
     def add_icon(out_html: str, label: str, icon_svg: str) -> str:
-        # Al icon aanwezig voor dit label? (heel simpele check)
-        if f'data-heroicon="' in out_html and f">{label}</strong>:" in out_html:
-            return out_html
-
-        # Vervang de meest voorkomende vormen. Geen regex → geen backtracking.
         patterns = [
-            f"<p><strong>{label}</strong>:",         # 1) <p><strong>Label</strong>:
-            f"<p> <strong>{label}</strong>:",        # 2) spatievarianten
-            f"<p><strong>{label}</strong> :",        # 3)
-            f"<p>{label}:",                          # 4) <p>Label:
-            f"<p> {label}:",                         # 5)
+            f"<p><strong>{label}</strong>:", f"<p> <strong>{label}</strong>:",
+            f"<p><strong>{label}</strong> :", f"<p>{label}:", f"<p> {label}:",
+            f"<p><strong>{label}</strong>&nbsp;:", f"<p>{label}&nbsp;:"
         ]
         for pat in patterns:
-            if pat in out_html:
+            idx = out_html.find(pat)
+            if idx != -1:
                 return out_html.replace(pat, f"<p>{icon_svg}<strong>{label}</strong>:", 1)
 
-        # Als niets matcht, laat zoals het is.
+        needle = f"<p><strong>{label}</strong>"
+        idx = out_html.lower().find(needle.lower())
+        if idx != -1:
+            return out_html.replace("<p><strong", f"<p>{icon_svg}<strong", 1)
+
         return out_html
 
     out = add_icon(out, "Lichtbehoefte", _icon_svg("sun"))
     out = add_icon(out, "Waterbehoefte", _icon_svg("droplet"))
     out = add_icon(out, "Standplaats",   _icon_svg("home"))
     out = add_icon(out, "Giftigheid",    _icon_svg("exclamation-triangle"))
+    out = add_icon(out, "Bloeiperiode",  _icon_svg("calendar"))
+    out = add_icon(out, "Plantperiode",  _icon_svg("sprout"))
 
     return out
 
@@ -478,7 +470,6 @@ def inject_heroicons(body_html: str) -> str:
 
 def update_product_texts(store_domain: str, token: str, product_id: int,
                          new_title: str, new_body_html: str, seo_title: str, seo_desc: str) -> None:
-    gid = f"gid://shopify/Product/{int(product_id)}"
     mutation = """
     mutation productSeoAndDesc($input: ProductInput!) {
       productUpdate(input: $input) {
@@ -486,19 +477,12 @@ def update_product_texts(store_domain: str, token: str, product_id: int,
         userErrors { field message }
       }
     }"""
-    variables = {"input": {
-        "id": gid,
-        "title": new_title,
-        "descriptionHtml": new_body_html,
-        "seo": {"title": seo_title or new_title, "description": seo_desc or ""}
-    }}
-    try:
-        data = _post(_gql_url(store_domain), token, {"query": mutation, "variables": variables})
-        errs = (data.get("data", {}).get("productUpdate", {}) or {}).get("userErrors", [])
-        if errs:
-            raise RuntimeError(f"Shopify productUpdate: {errs}")
-    except Exception as e:
-        raise RuntimeError(f"Shopify update_product_texts fout: {e}")
+    gid = f"gid://shopify/Product/{int(product_id)}"
+    variables = {"input": {"id": gid, "title": new_title, "descriptionHtml": new_body_html,
+                           "seo": {"title": seo_title or new_title, "description": seo_desc or ""}}}
+    data = _post(_gql_url(store_domain), token, {"query": mutation, "variables": variables})
+    errs = (data.get("data", {}).get("productUpdate", {}) or {}).get("userErrors", [])
+    if errs: raise RuntimeError(f"Shopify productUpdate: {errs}")
 
 def _defs_for_product(token: str, store_domain: str) -> List[Dict[str, Any]]:
     query = """
@@ -905,6 +889,25 @@ def api_optimize():
 
     sys_prompt = _build_system_prompt(txn)
 
+    # Bepaal of er tuin-collecties zitten in de selectie (stuurt prompt-hints)
+    garden_words = {"tuinplanten","bloeiende tuinplanten","siergrassen","hagen","klimplanten","olijfbomen","moestuin"}
+    selected_titles = []
+    # Probeer smart + custom; fouten negeren (id kan van ander type zijn)
+    for coll_id in colls:
+        try:
+            r1 = _get(f"https://{store}/admin/api/2024-07/smart_collections/{coll_id}.json", token)
+            t1 = (r1.json().get("smart_collection") or {}).get("title")
+            if t1: selected_titles.append(t1.lower())
+        except Exception:
+            pass
+        try:
+            r2 = _get(f"https://{store}/admin/api/2024-07/custom_collections/{coll_id}.json", token)
+            t2 = (r2.json().get("custom_collection") or {}).get("title")
+            if t2: selected_titles.append(t2.lower())
+        except Exception:
+            pass
+    is_garden_selection = any(any(w in t for w in garden_words) for t in selected_titles)
+
     def stream():
         try:
             # Stel de te verwerken producten vast:
@@ -938,19 +941,36 @@ def api_optimize():
                     pid=int(p["id"])
                     title=_s(p.get("title",""))
                     body=_s(p.get("body_html",""))
-                    base_prompt=(f"Originele titel: {title}\n"
-                                 f"Originele beschrijving (HTML toegestaan): {body}\n"
-                                 "Taken:\n"
-                                 "1) Lever ‘Nieuwe titel’ volgens format.\n"
-                                 "2) Lever ‘Beschrijving’ (HTML) met vaste h3-secties en 4 regels.\n"
-                                 "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n")
+
+                    # Bundel analyse (skip bij mix, qty prefix bewaren)
+                    skip_bundle, qty = analyze_bundle(title)
+                    if skip_bundle:
+                        yield f"⏭️ #{pid}: overgeslagen (bundel met verschillende producten)\n"
+                        continue
+
+                    base_prompt = (
+                        f"Originele titel: {title}\n"
+                        f"Originele beschrijving (HTML toegestaan): {body}\n"
+                        "Taken:\n"
+                        "1) Lever ‘Nieuwe titel’ volgens format.\n"
+                        "2) Lever ‘Beschrijving’ (HTML) met vaste h3-secties en 4 regels.\n"
+                        "3) Lever ‘Meta title’ (≤60) en ‘Meta description’ (≤155).\n"
+                    )
+
+                    if is_garden_selection:
+                        base_prompt += (
+                            "\nVOOR TUINPLANTEN (alleen opnemen als betrouwbaar/relevant):\n"
+                            "- Voeg extra regels toe onder ‘Eigenschappen & behoeften’:\n"
+                            "  <p><strong>Bloeiperiode</strong>: …</p> (bij bloeiende tuinplanten)\n"
+                            "  <p><strong>Plantperiode</strong>: …</p>\n"
+                            "Schrijf niets als je het niet met hoge zekerheid weet.\n"
+                        )
+
                     try:
-                        t0 = time.time()
                         yield f"→ #{pid}: AI-tekst genereren...\n"
                         ai_raw=_openai_chat(sys_prompt, base_prompt)
-                        yield f"   • OpenAI klaar in {time.time()-t0:.1f}s\n"
-
                         pieces=split_ai_output(ai_raw)
+
                         title_ai=enforce_title_name_map(_s(pieces.get("title")) or title)
                         body_ai=_s(pieces.get("body_html")) or body
 
@@ -959,28 +979,26 @@ def api_optimize():
                         pot_present=detect_pot_presence(title_ai, body_ai)
 
                         final_title=normalize_title(title_ai, dims, pot_color, pot_present)
+
+                        # bundel-qty prefix behouden
+                        if qty and not re.match(r"^\s*\d+\s*[xX]\s+", final_title):
+                            final_title = f"{qty}x {final_title}"
+
                         yield "   • Iconen injecteren…\n"
                         final_body = inject_heroicons(body_ai)
                         yield "   • Iconen klaar\n"
 
-                        final_meta_title = finalize_meta_title(pieces.get("meta_title"), final_title)
-                        final_meta_desc  = finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
+                        final_meta_title=finalize_meta_title(pieces.get("meta_title"), final_title)
+                        final_meta_desc =finalize_meta_desc(pieces.get("meta_description"), final_body, final_title, txn)
 
-                        # Shopify productUpdate
-                        yield f"   • Shopify update starten voor #{pid}…\n"
-                        t1 = time.time()
                         update_product_texts(store, token, pid, final_title, final_body, final_meta_title, final_meta_desc)
-                        yield f"   • Shopify update klaar in {time.time()-t1:.1f}s\n"
 
-                        # Metafields
                         missing={}
                         if dims.get("height_cm"):       missing["height_cm"]=dims["height_cm"]
                         if dims.get("pot_diameter_cm"): missing["pot_diameter_cm"]=dims["pot_diameter_cm"]
                         if missing:
-                            yield f"   • Metafields zetten: {missing}\n"
-                            t2 = time.time()
                             w=set_product_metafields(token, store, pid, missing)
-                            yield f"   • Metafields gezet in {time.time()-t2:.1f}s → {w}\n"
+                            yield f"   • Metafields aangevuld: {missing} → {w}\n"
                         else:
                             yield "   • Metafields al aanwezig of geen waarden gevonden\n"
 
